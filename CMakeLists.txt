@@ -82,19 +82,30 @@ set(CMAKE_CUDA_ARCHITECTURES "75;80;86;87;89;90;100;120" CACHE STRING "CUDA arch
 set(CMAKE_CUDA_RUNTIME_LIBRARY "Shared" CACHE STRING "Use shared CUDA runtime")
 enable_language(CUDA)
 
-# Find dependencies
+# Docker build option - skip test/sample dependencies
+option(DOCKER_BUILD "Building in Docker container (skip test deps)" OFF)
+
+# Find core dependencies (always required)
 find_package(AudioFile REQUIRED)
-find_package(Benchmark REQUIRED)
-find_package(Cnpy REQUIRED)
-find_package(CXXOPTS REQUIRED)
 find_package(Eigen3 REQUIRED)
-find_package(GTest REQUIRED)
 find_package(MagicEnum REQUIRED)
 find_package(NlohmannJson REQUIRED)
 find_package(ReflCpp REQUIRED)
 find_package(TbtSVD REQUIRED)
 find_package(TensorRT REQUIRED)
 find_package(ZLIB 1.3.1 REQUIRED)
+
+# Test/benchmark dependencies - skip in Docker builds
+if(BUILD_TESTING AND NOT DOCKER_BUILD)
+    find_package(Benchmark REQUIRED)
+    find_package(GTest REQUIRED)
+endif()
+
+# Sample/CLI dependencies - skip in Docker builds
+if(BUILD_SAMPLES AND NOT DOCKER_BUILD)
+    find_package(Cnpy REQUIRED)
+    find_package(CXXOPTS REQUIRED)
+endif()
 
 # Install pip dependencies from deps/requirements.txt
 add_custom_target(install-pip-deps
@@ -142,7 +153,10 @@ if (NOT DEFINED AUDIO2X_SDK_ROOT)
     set(AUDIO2X_SDK_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
-enable_testing()
+# Only enable testing when not in Docker build mode
+if(BUILD_TESTING AND NOT DOCKER_BUILD)
+    enable_testing()
+endif()
 
 add_subdirectory(audio2x-common)
 add_subdirectory(audio2emotion-sdk)

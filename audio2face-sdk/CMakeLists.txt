@@ -1,6 +1,13 @@
 set(A2F_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
 
 add_subdirectory(source/audio2face-core)
-add_subdirectory(tests)
-add_subdirectory(source/benchmarks)
-add_subdirectory(source/samples)
+
+# Tests and benchmarks are optional (skip in Docker builds)
+if(BUILD_TESTING AND NOT DOCKER_BUILD)
+    add_subdirectory(tests)
+    add_subdirectory(source/benchmarks)
+endif()
+
+if(BUILD_SAMPLES AND NOT DOCKER_BUILD)
+    add_subdirectory(source/samples)
+endif()
