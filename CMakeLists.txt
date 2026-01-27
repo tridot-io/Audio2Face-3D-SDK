@@ -87,6 +87,7 @@ option(DOCKER_BUILD "Building in Docker container (skip test deps)" OFF)
 
 # Find core dependencies (always required)
 find_package(AudioFile REQUIRED)
+find_package(Cnpy REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(MagicEnum REQUIRED)
 find_package(NlohmannJson REQUIRED)
@@ -103,7 +104,6 @@ endif()
 
 # Sample/CLI dependencies - skip in Docker builds
 if(BUILD_SAMPLES AND NOT DOCKER_BUILD)
-    find_package(Cnpy REQUIRED)
     find_package(CXXOPTS REQUIRED)
 endif()
 
