@@ -2,4 +2,19 @@ __pycache__/
 /_build/
 /_data/
 /_deps/
-/venv/
+/venv/_data/
+generated/
+*.msys*
+_build/
+sdk_venv/
+
+# Local environment
+venv/
+sdk_venv/
+_build/
+_data/
+generated/
+*.trt
+*.msys*
+__pycache__/
+*.pyc
