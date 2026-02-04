@@ -44,6 +44,8 @@ typedef enum {
     A2F_ERROR_SESSION_CLOSED = 6,
     A2F_ERROR_CALLBACK_ERROR = 7,
     A2F_ERROR_EXECUTION_FAILED = 8,
+    A2F_ERROR_A2E_INIT_FAILED = 9,
+    A2F_ERROR_A2E_EXECUTION_FAILED = 10,
     A2F_ERROR_UNKNOWN = 99
 } A2FErrorCode;
 
@@ -52,9 +54,11 @@ typedef enum {
  */
 typedef struct {
     const char* model_path;        /**< Path to model.json file */
+    const char* a2e_model_path;    /**< Path to A2E model.json file (NULL to disable A2E) */
     int device_id;                 /**< CUDA device ID (default: 0) */
     size_t identity_index;         /**< Identity index for multi-identity models */
     int use_constant_noise;        /**< 1 = use constant noise for deterministic output */
+    int enable_audio2emotion;      /**< 1 = enable Audio2Emotion for eyebrow/expression inference */
 } A2FContextConfig;
 
 /**

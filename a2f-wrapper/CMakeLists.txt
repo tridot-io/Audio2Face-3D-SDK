@@ -28,7 +28,7 @@ target_include_directories(a2f_wrapper
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-# Link against audio2x library (contains all SDK functionality)
+# Link against audio2x library (contains all SDK functionality including audio2emotion)
 target_link_libraries(a2f_wrapper
     PRIVATE
         audio2x

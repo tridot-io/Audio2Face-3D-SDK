@@ -5,6 +5,7 @@
 
 #include "a2f_wrapper.h"
 #include "audio2face/audio2face.h"
+#include "audio2emotion/audio2emotion.h"
 #include "audio2x/cuda_utils.h"
 
 #include <mutex>
@@ -61,6 +62,13 @@ struct A2FContext {
     UniquePtr<nva2f::IDiffusionModel::IGeometryModelInfo> modelInfo;
     UniquePtr<nva2f::IDiffusionModel::IBlendshapeSolveModelInfo> blendshapeSolveModelInfo;
 
+    // A2E (Audio2Emotion) components
+    UniquePtr<nva2e::IClassifierModel::IEmotionModelInfo> a2eModelInfo;
+    UniquePtr<nva2e::IEmotionExecutor> emotionExecutor;
+    UniquePtr<nva2e::IEmotionBinder> emotionBinder;
+    bool a2eEnabled = false;
+    std::string a2eModelPath;
+
     // Cached blendshape names
     std::vector<std::string> blendshapeNames;
     std::vector<const char*> blendshapeNamePtrs;  // For C API
@@ -97,6 +105,7 @@ struct A2FSession {
     // State
     std::atomic<bool> audioFinalized{false};
     std::atomic<bool> emotionInitialized{false};
+    std::atomic<bool> emotionAccumulatorClosed{false};
 
     // Thread safety
     std::mutex mutex;
@@ -248,6 +257,52 @@ A2F_API A2FErrorCode a2f_context_create(
             }
         }
 
+        // Initialize A2E (Audio2Emotion) if enabled
+        if (config->enable_audio2emotion && config->a2e_model_path) {
+            ctx->a2eEnabled = true;
+            ctx->a2eModelPath = config->a2e_model_path;
+
+            // 1. Load A2E classifier model info
+            auto* rawA2eModelInfo = nva2e::ReadClassifierModelInfo(ctx->a2eModelPath.c_str());
+            if (!rawA2eModelInfo) {
+                SetLastError("Failed to load A2E model from: " + ctx->a2eModelPath);
+                return A2F_ERROR_A2E_INIT_FAILED;
+            }
+            ctx->a2eModelInfo = ToUniquePtr(rawA2eModelInfo);
+
+            // 2. Create EmotionExecutor creation parameters
+            nva2e::EmotionExecutorCreationParameters emotionParams;
+            emotionParams.cudaStream = ctx->bundle->GetCudaStream().Data();
+            emotionParams.nbTracks = 1;
+            const auto sharedAudioAccumulator = &ctx->bundle->GetAudioAccumulator(0);
+            emotionParams.sharedAudioAccumulators = &sharedAudioAccumulator;
+
+            // 3. Get classifier-specific parameters (30 FPS output, skip 30 inferences)
+            auto classifierParams = ctx->a2eModelInfo->GetExecutorCreationParameters(
+                60000,  // bufferLength (samples)
+                30,     // frameRateNumerator
+                1,      // frameRateDenominator
+                30      // inferencesToSkip
+            );
+
+            // 4. Create EmotionExecutor
+            auto* rawEmotionExecutor = nva2e::CreateClassifierEmotionExecutor(emotionParams, classifierParams);
+            if (!rawEmotionExecutor) {
+                SetLastError("Failed to create A2E emotion executor");
+                return A2F_ERROR_A2E_INIT_FAILED;
+            }
+            ctx->emotionExecutor = ToUniquePtr(rawEmotionExecutor);
+
+            // 5. Create EmotionBinder (connects executor output to emotionAccumulator)
+            auto* emotionAcc = &ctx->bundle->GetEmotionAccumulator(0);
+            auto* rawEmotionBinder = nva2e::CreateEmotionBinder(*ctx->emotionExecutor, &emotionAcc, 1);
+            if (!rawEmotionBinder) {
+                SetLastError("Failed to create A2E emotion binder");
+                return A2F_ERROR_A2E_INIT_FAILED;
+            }
+            ctx->emotionBinder = ToUniquePtr(rawEmotionBinder);
+        }
+
         ctx->initialized = true;
         *out_context = ctx.release();
         return A2F_OK;
@@ -397,25 +452,8 @@ A2F_API A2FErrorCode a2f_session_push_audio(
     }
 
     try {
-        // Initialize emotion accumulator on first audio push (neutral emotion)
-        if (!session->emotionInitialized.exchange(true)) {
-            auto& emotionAccumulator = context->bundle->GetEmotionAccumulator(session->trackIndex);
-            std::vector<float> emptyEmotion(emotionAccumulator.GetEmotionSize(), 0.0f);
-            auto err = emotionAccumulator.Accumulate(
-                0,
-                nva2x::HostTensorFloatConstView{emptyEmotion.data(), emptyEmotion.size()},
-                context->bundle->GetCudaStream().Data()
-            );
-            if (err) {
-                SetLastError(err);
-                return A2F_ERROR_EXECUTION_FAILED;
-            }
-            err = emotionAccumulator.Close();
-            if (err) {
-                SetLastError(err);
-                return A2F_ERROR_EXECUTION_FAILED;
-            }
-        }
+        // Note: Emotion accumulator initialization moved to a2f_session_finalize()
+        // A2E executor will populate emotions from audio, or neutral fallback will be used
 
         // Accumulate audio
         auto& audioAccumulator = context->bundle->GetAudioAccumulator(session->trackIndex);
@@ -471,6 +509,17 @@ A2F_API A2FErrorCode a2f_session_execute(
     }
 
     try {
+        // Execute A2E (Audio2Emotion) first to populate emotion accumulator
+        if (context->a2eEnabled && context->emotionExecutor) {
+            while (nva2x::GetNbReadyTracks(*context->emotionExecutor) > 0) {
+                auto err = context->emotionExecutor->Execute(nullptr);
+                if (err) {
+                    SetLastError(err);
+                    return A2F_ERROR_A2E_EXECUTION_FAILED;
+                }
+            }
+        }
+
         auto& executor = context->bundle->GetExecutor();
 
         // Execute for ready tracks
@@ -512,7 +561,7 @@ A2F_API A2FErrorCode a2f_session_finalize(A2FSession* session) {
     }
 
     try {
-        // Close audio accumulator
+        // 1. Close audio accumulator
         auto& audioAccumulator = context->bundle->GetAudioAccumulator(session->trackIndex);
         auto err = audioAccumulator.Close();
         if (err) {
@@ -523,14 +572,61 @@ A2F_API A2FErrorCode a2f_session_finalize(A2FSession* session) {
         session->audioFinalized = true;
 
         auto& executor = context->bundle->GetExecutor();
+        auto& emotionAccumulator = context->bundle->GetEmotionAccumulator(session->trackIndex);
 
-        // Execute until all frames are processed
-        while (nva2x::GetNbReadyTracks(executor) > 0) {
-            err = executor.Execute(nullptr);
-            if (err) {
-                SetLastError(err);
-                return A2F_ERROR_EXECUTION_FAILED;
+        // 2. Process loop: A2E → close emotion accumulator when done → A2F
+        while (true) {
+            // Process A2E (Audio2Emotion)
+            if (context->a2eEnabled && context->emotionExecutor) {
+                while (nva2x::GetNbReadyTracks(*context->emotionExecutor) > 0) {
+                    err = context->emotionExecutor->Execute(nullptr);
+                    if (err) {
+                        SetLastError(err);
+                        return A2F_ERROR_A2E_EXECUTION_FAILED;
+                    }
+                }
+
+                // Check if A2E is complete - close emotion accumulator
+                if (!session->emotionAccumulatorClosed &&
+                    context->emotionExecutor->GetNbAvailableExecutions(session->trackIndex) == 0) {
+                    err = emotionAccumulator.Close();
+                    if (err) {
+                        SetLastError(err);
+                        return A2F_ERROR_EXECUTION_FAILED;
+                    }
+                    session->emotionAccumulatorClosed = true;
+                }
+            } else if (!session->emotionAccumulatorClosed) {
+                // A2E disabled: fallback to neutral emotion for backward compatibility
+                std::vector<float> neutralEmotion(emotionAccumulator.GetEmotionSize(), 0.0f);
+                err = emotionAccumulator.Accumulate(
+                    0,
+                    nva2x::HostTensorFloatConstView{neutralEmotion.data(), neutralEmotion.size()},
+                    context->bundle->GetCudaStream().Data()
+                );
+                if (err) {
+                    SetLastError(err);
+                    return A2F_ERROR_EXECUTION_FAILED;
+                }
+                err = emotionAccumulator.Close();
+                if (err) {
+                    SetLastError(err);
+                    return A2F_ERROR_EXECUTION_FAILED;
+                }
+                session->emotionAccumulatorClosed = true;
             }
+
+            // Process A2F (Audio2Face)
+            if (nva2x::GetNbReadyTracks(executor) > 0) {
+                err = executor.Execute(nullptr);
+                if (err) {
+                    SetLastError(err);
+                    return A2F_ERROR_EXECUTION_FAILED;
+                }
+                continue;
+            }
+
+            break;
         }
 
         // Wait for async work to complete
@@ -585,8 +681,18 @@ A2F_API A2FErrorCode a2f_session_reset(A2FSession* session) {
             return A2F_ERROR_EXECUTION_FAILED;
         }
 
+        // Reset emotion executor if A2E is enabled
+        if (context->a2eEnabled && context->emotionExecutor) {
+            err = context->emotionExecutor->Reset(session->trackIndex);
+            if (err) {
+                SetLastError(err);
+                return A2F_ERROR_EXECUTION_FAILED;
+            }
+        }
+
         session->audioFinalized = false;
         session->emotionInitialized = false;
+        session->emotionAccumulatorClosed = false;
         session->frameWeights.clear();
 
         return A2F_OK;
@@ -619,6 +725,11 @@ A2F_API A2FErrorCode a2f_session_destroy(A2FSession* session) {
                 // Reset executor track
                 auto& executor = context->bundle->GetExecutor();
                 executor.Reset(session->trackIndex);
+
+                // Reset emotion executor if A2E is enabled
+                if (context->a2eEnabled && context->emotionExecutor) {
+                    context->emotionExecutor->Reset(session->trackIndex);
+                }
             } catch (...) {
                 // Ignore errors during cleanup
             }
