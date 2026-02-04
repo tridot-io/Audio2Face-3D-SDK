@@ -169,6 +169,10 @@ static void SdkHostResultsCallback(
 struct EmotionCallbackData {
     A2FContext* context;
     nva2x::IEmotionAccumulator* emotionAccumulator;
+
+    // For change detection
+    int lastTopEmotion = -1;
+    int frameCount = 0;
 };
 
 // Custom emotion callback that logs emotions before accumulating
@@ -181,7 +185,7 @@ static bool EmotionResultsCallback(void* userdata, const nva2e::IEmotionExecutor
     auto* ctx = data->context;
     size_t emotionSize = results.emotions.Size();
 
-    // Log emotions if enabled
+    // Log emotions only when top emotion changes
     if (ctx->logEmotions && emotionSize > 0) {
         // Copy emotions from device to host for logging
         std::vector<float> hostEmotions(emotionSize);
@@ -199,9 +203,12 @@ static bool EmotionResultsCallback(void* userdata, const nva2e::IEmotionExecutor
             }
         }
 
-        // Log if top emotion value is significant
-        if (topVal > 0.1f) {
-            A2F_LOG_EMOTION("t=%.3f Top: %s (%.2f) | Angry:%.2f Happy:%.2f Sad:%.2f",
+        data->frameCount++;
+
+        // Log only when top emotion changes (and value is significant)
+        if (topVal > 0.1f && topIdx != data->lastTopEmotion) {
+            data->lastTopEmotion = topIdx;
+            A2F_LOG_EMOTION("t=%.2fs CHANGE → %s (%.2f) | Angry:%.2f Happy:%.2f Sad:%.2f",
                 static_cast<double>(results.timeStampCurrentFrame) / 16000.0,
                 EMOTION_NAMES[topIdx], topVal,
                 hostEmotions[1], hostEmotions[6], hostEmotions[9]);
