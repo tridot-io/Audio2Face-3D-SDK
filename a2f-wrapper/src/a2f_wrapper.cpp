@@ -7,6 +7,7 @@
 #include "audio2face/audio2face.h"
 #include "audio2emotion/audio2emotion.h"
 #include "audio2x/cuda_utils.h"
+#include <cuda_runtime.h>
 
 #include <mutex>
 #include <atomic>
@@ -20,6 +21,13 @@
 
 // Simple logging macro for timing (to stderr)
 #define A2F_LOG_TIMING(fmt, ...) fprintf(stderr, "[A2F TIMING] " fmt "\n", ##__VA_ARGS__)
+#define A2F_LOG_EMOTION(fmt, ...) fprintf(stderr, "[A2F EMOTION] " fmt "\n", ##__VA_ARGS__)
+
+// Emotion names (indices 0-9)
+static const char* EMOTION_NAMES[10] = {
+    "Amazement", "Angry", "Cheekiness", "Disgust", "Fear",
+    "Grief", "Happy", "OutOfBreath", "Pain", "Sad"
+};
 
 //
 // Thread-local error message storage
@@ -60,6 +68,7 @@ UniquePtr<T> ToUniquePtr(T* ptr) {
 //
 
 struct A2FSession;  // Forward declaration
+struct EmotionCallbackData;  // Forward declaration
 
 struct A2FContext {
     // SDK components
@@ -70,9 +79,10 @@ struct A2FContext {
     // A2E (Audio2Emotion) components
     UniquePtr<nva2e::IClassifierModel::IEmotionModelInfo> a2eModelInfo;
     UniquePtr<nva2e::IEmotionExecutor> emotionExecutor;
-    UniquePtr<nva2e::IEmotionBinder> emotionBinder;
     bool a2eEnabled = false;
     std::string a2eModelPath;
+    bool logEmotions = true;  // Log detected emotions
+    std::unique_ptr<EmotionCallbackData> emotionCallbackData;  // Callback data for emotion logging
 
     // Cached blendshape names
     std::vector<std::string> blendshapeNames;
@@ -151,6 +161,61 @@ static void SdkHostResultsCallback(
 
     // Invoke user callback
     session->callback(session->userData, &frame);
+}
+
+//
+// Emotion callback data structure
+//
+struct EmotionCallbackData {
+    A2FContext* context;
+    nva2x::IEmotionAccumulator* emotionAccumulator;
+};
+
+// Custom emotion callback that logs emotions before accumulating
+static bool EmotionResultsCallback(void* userdata, const nva2e::IEmotionExecutor::Results& results) {
+    auto* data = static_cast<EmotionCallbackData*>(userdata);
+    if (!data || !data->context || !data->emotionAccumulator) {
+        return false;
+    }
+
+    auto* ctx = data->context;
+    size_t emotionSize = results.emotions.Size();
+
+    // Log emotions if enabled
+    if (ctx->logEmotions && emotionSize > 0) {
+        // Copy emotions from device to host for logging
+        std::vector<float> hostEmotions(emotionSize);
+        cudaMemcpyAsync(hostEmotions.data(), results.emotions.Data(),
+                        emotionSize * sizeof(float), cudaMemcpyDeviceToHost, results.cudaStream);
+        cudaStreamSynchronize(results.cudaStream);
+
+        // Find top emotion
+        int topIdx = 0;
+        float topVal = hostEmotions[0];
+        for (size_t i = 1; i < emotionSize && i < 10; ++i) {
+            if (hostEmotions[i] > topVal) {
+                topVal = hostEmotions[i];
+                topIdx = static_cast<int>(i);
+            }
+        }
+
+        // Log if top emotion value is significant
+        if (topVal > 0.1f) {
+            A2F_LOG_EMOTION("t=%.3f Top: %s (%.2f) | Angry:%.2f Happy:%.2f Sad:%.2f",
+                static_cast<double>(results.timeStampCurrentFrame) / 16000.0,
+                EMOTION_NAMES[topIdx], topVal,
+                hostEmotions[1], hostEmotions[6], hostEmotions[9]);
+        }
+    }
+
+    // Accumulate emotions to the accumulator
+    auto err = data->emotionAccumulator->Accumulate(
+        results.trackIndex,
+        results.emotions,
+        results.cudaStream
+    );
+
+    return !err;  // Return true to continue, false on error
 }
 
 //
@@ -298,14 +363,17 @@ A2F_API A2FErrorCode a2f_context_create(
             }
             ctx->emotionExecutor = ToUniquePtr(rawEmotionExecutor);
 
-            // 5. Create EmotionBinder (connects executor output to emotionAccumulator)
-            auto* emotionAcc = &ctx->bundle->GetEmotionAccumulator(0);
-            auto* rawEmotionBinder = nva2e::CreateEmotionBinder(*ctx->emotionExecutor, &emotionAcc, 1);
-            if (!rawEmotionBinder) {
-                SetLastError("Failed to create A2E emotion binder");
+            // 5. Set up custom emotion callback (instead of EmotionBinder) to enable logging
+            ctx->emotionCallbackData = std::make_unique<EmotionCallbackData>();
+            ctx->emotionCallbackData->context = ctx.get();
+            ctx->emotionCallbackData->emotionAccumulator = &ctx->bundle->GetEmotionAccumulator(0);
+
+            auto callbackErr = ctx->emotionExecutor->SetResultsCallback(
+                EmotionResultsCallback, ctx->emotionCallbackData.get());
+            if (callbackErr) {
+                SetLastError("Failed to set A2E emotion callback: " + callbackErr.message());
                 return A2F_ERROR_A2E_INIT_FAILED;
             }
-            ctx->emotionBinder = ToUniquePtr(rawEmotionBinder);
         }
 
         ctx->initialized = true;
