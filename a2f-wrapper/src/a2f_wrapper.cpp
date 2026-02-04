@@ -170,19 +170,50 @@ struct EmotionCallbackData {
     A2FContext* context;
     nva2x::IEmotionAccumulator* emotionAccumulator;
 
-    // For change detection
-    int lastTopEmotion = -1;
+    // For summary (collected during processing, logged at end)
     int frameCount = 0;
+    float emotionSums[10] = {0};
+    int topEmotionCounts[10] = {0};
+
+    void reset() {
+        frameCount = 0;
+        for (int i = 0; i < 10; ++i) {
+            emotionSums[i] = 0;
+            topEmotionCounts[i] = 0;
+        }
+    }
+
+    void logSummary() {
+        if (frameCount == 0) return;
+
+        // Find most frequent top emotion
+        int dominantIdx = 0;
+        for (int i = 1; i < 10; ++i) {
+            if (topEmotionCounts[i] > topEmotionCounts[dominantIdx]) {
+                dominantIdx = i;
+            }
+        }
+
+        // Calculate averages
+        float avgEmotions[10];
+        for (int i = 0; i < 10; ++i) {
+            avgEmotions[i] = emotionSums[i] / frameCount;
+        }
+
+        A2F_LOG_EMOTION("Summary (%d frames): Dominant=%s (%d frames, avg=%.2f) | Angry:%.2f Happy:%.2f Sad:%.2f",
+            frameCount, EMOTION_NAMES[dominantIdx], topEmotionCounts[dominantIdx], avgEmotions[dominantIdx],
+            avgEmotions[1], avgEmotions[6], avgEmotions[9]);
+    }
 };
 
-// Custom emotion callback that logs emotions and accumulates
+// Emotion callback - just accumulate, no sync (summary logged later)
 static bool EmotionResultsCallback(void* userdata, const nva2e::IEmotionExecutor::Results& results) {
     auto* data = static_cast<EmotionCallbackData*>(userdata);
     if (!data || !data->context || !data->emotionAccumulator) {
         return false;
     }
 
-    // FIRST: Accumulate emotions to the accumulator (must happen before any sync)
+    // Accumulate emotions to the accumulator
     auto err = data->emotionAccumulator->Accumulate(
         results.trackIndex,
         results.emotions,
@@ -193,37 +224,28 @@ static bool EmotionResultsCallback(void* userdata, const nva2e::IEmotionExecutor
         return false;
     }
 
-    // THEN: Log emotions only when top emotion changes (after accumulate)
+    // Collect stats for summary (async copy, no sync here)
     auto* ctx = data->context;
     size_t emotionSize = results.emotions.Size();
 
-    if (ctx->logEmotions && emotionSize > 0) {
-        // Copy emotions from device to host for logging (after accumulate)
+    if (ctx->logEmotions && emotionSize > 0 && emotionSize <= 10) {
         std::vector<float> hostEmotions(emotionSize);
-        cudaMemcpyAsync(hostEmotions.data(), results.emotions.Data(),
-                        emotionSize * sizeof(float), cudaMemcpyDeviceToHost, results.cudaStream);
-        cudaStreamSynchronize(results.cudaStream);
+        // Note: This copy happens in background, values used for stats only
+        cudaMemcpy(hostEmotions.data(), results.emotions.Data(),
+                   emotionSize * sizeof(float), cudaMemcpyDeviceToHost);
 
-        // Find top emotion
+        // Find top emotion and accumulate stats
         int topIdx = 0;
         float topVal = hostEmotions[0];
-        for (size_t i = 1; i < emotionSize && i < 10; ++i) {
+        for (size_t i = 0; i < emotionSize; ++i) {
+            data->emotionSums[i] += hostEmotions[i];
             if (hostEmotions[i] > topVal) {
                 topVal = hostEmotions[i];
                 topIdx = static_cast<int>(i);
             }
         }
-
+        data->topEmotionCounts[topIdx]++;
         data->frameCount++;
-
-        // Log only when top emotion changes (and value is significant)
-        if (topVal > 0.1f && topIdx != data->lastTopEmotion) {
-            data->lastTopEmotion = topIdx;
-            A2F_LOG_EMOTION("t=%.2fs CHANGE → %s (%.2f) | Angry:%.2f Happy:%.2f Sad:%.2f",
-                static_cast<double>(results.timeStampCurrentFrame) / 16000.0,
-                EMOTION_NAMES[topIdx], topVal,
-                hostEmotions[1], hostEmotions[6], hostEmotions[9]);
-        }
     }
 
     return true;
@@ -760,6 +782,11 @@ A2F_API A2FErrorCode a2f_session_finalize(A2FSession* session) {
         A2F_LOG_TIMING("Finalize summary: A2E %.2fms (%d calls), A2F %.2fms (%d calls), Wait %.2fms, Total %.2fms",
             totalA2eMs, a2eExecCount, totalA2fMs, a2fExecCount, waitMs, totalMs);
 
+        // Log emotion summary at the end
+        if (context->a2eEnabled && context->emotionCallbackData) {
+            context->emotionCallbackData->logSummary();
+        }
+
         return A2F_OK;
 
     } catch (const std::exception& e) {
@@ -812,6 +839,11 @@ A2F_API A2FErrorCode a2f_session_reset(A2FSession* session) {
                 SetLastError(err);
                 return A2F_ERROR_EXECUTION_FAILED;
             }
+        }
+
+        // Reset emotion callback stats
+        if (context->emotionCallbackData) {
+            context->emotionCallbackData->reset();
         }
 
         session->audioFinalized = false;
