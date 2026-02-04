@@ -15,6 +15,11 @@
 #include <memory>
 #include <cstring>
 #include <thread>
+#include <chrono>
+#include <cstdio>
+
+// Simple logging macro for timing (to stderr)
+#define A2F_LOG_TIMING(fmt, ...) fprintf(stderr, "[A2F TIMING] " fmt "\n", ##__VA_ARGS__)
 
 //
 // Thread-local error message storage
@@ -509,14 +514,24 @@ A2F_API A2FErrorCode a2f_session_execute(
     }
 
     try {
+        using Clock = std::chrono::high_resolution_clock;
+
         // Execute A2E (Audio2Emotion) first to populate emotion accumulator
         if (context->a2eEnabled && context->emotionExecutor) {
+            auto a2eStart = Clock::now();
+            int a2eExecCount = 0;
             while (nva2x::GetNbReadyTracks(*context->emotionExecutor) > 0) {
                 auto err = context->emotionExecutor->Execute(nullptr);
                 if (err) {
                     SetLastError(err);
                     return A2F_ERROR_A2E_EXECUTION_FAILED;
                 }
+                a2eExecCount++;
+            }
+            if (a2eExecCount > 0) {
+                auto a2eEnd = Clock::now();
+                auto a2eMs = std::chrono::duration<double, std::milli>(a2eEnd - a2eStart).count();
+                A2F_LOG_TIMING("A2E execute: %d calls, %.2fms", a2eExecCount, a2eMs);
             }
         }
 
@@ -529,7 +544,12 @@ A2F_API A2FErrorCode a2f_session_execute(
         }
 
         if (readyTracks > 0) {
+            auto a2fStart = Clock::now();
             auto err = executor.Execute(nullptr);
+            auto a2fEnd = Clock::now();
+            auto a2fMs = std::chrono::duration<double, std::milli>(a2fEnd - a2fStart).count();
+            A2F_LOG_TIMING("A2F execute: %.2fms (ready tracks: %zu)", a2fMs, readyTracks);
+
             if (err) {
                 SetLastError(err);
                 return A2F_ERROR_EXECUTION_FAILED;
@@ -561,6 +581,13 @@ A2F_API A2FErrorCode a2f_session_finalize(A2FSession* session) {
     }
 
     try {
+        using Clock = std::chrono::high_resolution_clock;
+        auto finalizeStart = Clock::now();
+        double totalA2eMs = 0.0;
+        double totalA2fMs = 0.0;
+        int a2eExecCount = 0;
+        int a2fExecCount = 0;
+
         // 1. Close audio accumulator
         auto& audioAccumulator = context->bundle->GetAudioAccumulator(session->trackIndex);
         auto err = audioAccumulator.Close();
@@ -579,7 +606,11 @@ A2F_API A2FErrorCode a2f_session_finalize(A2FSession* session) {
             // Process A2E (Audio2Emotion)
             if (context->a2eEnabled && context->emotionExecutor) {
                 while (nva2x::GetNbReadyTracks(*context->emotionExecutor) > 0) {
+                    auto a2eStart = Clock::now();
                     err = context->emotionExecutor->Execute(nullptr);
+                    auto a2eEnd = Clock::now();
+                    totalA2eMs += std::chrono::duration<double, std::milli>(a2eEnd - a2eStart).count();
+                    a2eExecCount++;
                     if (err) {
                         SetLastError(err);
                         return A2F_ERROR_A2E_EXECUTION_FAILED;
@@ -618,7 +649,11 @@ A2F_API A2FErrorCode a2f_session_finalize(A2FSession* session) {
 
             // Process A2F (Audio2Face)
             if (nva2x::GetNbReadyTracks(executor) > 0) {
+                auto a2fStart = Clock::now();
                 err = executor.Execute(nullptr);
+                auto a2fEnd = Clock::now();
+                totalA2fMs += std::chrono::duration<double, std::milli>(a2fEnd - a2fStart).count();
+                a2fExecCount++;
                 if (err) {
                     SetLastError(err);
                     return A2F_ERROR_EXECUTION_FAILED;
@@ -630,11 +665,21 @@ A2F_API A2FErrorCode a2f_session_finalize(A2FSession* session) {
         }
 
         // Wait for async work to complete
+        auto waitStart = Clock::now();
         err = executor.Wait(session->trackIndex);
+        auto waitEnd = Clock::now();
+        auto waitMs = std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();
+
         if (err) {
             SetLastError(err);
             return A2F_ERROR_EXECUTION_FAILED;
         }
+
+        auto finalizeEnd = Clock::now();
+        auto totalMs = std::chrono::duration<double, std::milli>(finalizeEnd - finalizeStart).count();
+
+        A2F_LOG_TIMING("Finalize summary: A2E %.2fms (%d calls), A2F %.2fms (%d calls), Wait %.2fms, Total %.2fms",
+            totalA2eMs, a2eExecCount, totalA2fMs, a2fExecCount, waitMs, totalMs);
 
         return A2F_OK;
 
