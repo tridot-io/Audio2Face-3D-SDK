@@ -175,19 +175,30 @@ struct EmotionCallbackData {
     int frameCount = 0;
 };
 
-// Custom emotion callback that logs emotions before accumulating
+// Custom emotion callback that logs emotions and accumulates
 static bool EmotionResultsCallback(void* userdata, const nva2e::IEmotionExecutor::Results& results) {
     auto* data = static_cast<EmotionCallbackData*>(userdata);
     if (!data || !data->context || !data->emotionAccumulator) {
         return false;
     }
 
+    // FIRST: Accumulate emotions to the accumulator (must happen before any sync)
+    auto err = data->emotionAccumulator->Accumulate(
+        results.trackIndex,
+        results.emotions,
+        results.cudaStream
+    );
+
+    if (err) {
+        return false;
+    }
+
+    // THEN: Log emotions only when top emotion changes (after accumulate)
     auto* ctx = data->context;
     size_t emotionSize = results.emotions.Size();
 
-    // Log emotions only when top emotion changes
     if (ctx->logEmotions && emotionSize > 0) {
-        // Copy emotions from device to host for logging
+        // Copy emotions from device to host for logging (after accumulate)
         std::vector<float> hostEmotions(emotionSize);
         cudaMemcpyAsync(hostEmotions.data(), results.emotions.Data(),
                         emotionSize * sizeof(float), cudaMemcpyDeviceToHost, results.cudaStream);
@@ -215,14 +226,7 @@ static bool EmotionResultsCallback(void* userdata, const nva2e::IEmotionExecutor
         }
     }
 
-    // Accumulate emotions to the accumulator
-    auto err = data->emotionAccumulator->Accumulate(
-        results.trackIndex,
-        results.emotions,
-        results.cudaStream
-    );
-
-    return !err;  // Return true to continue, false on error
+    return true;
 }
 
 //
