@@ -7,7 +7,6 @@
 #include "audio2face/audio2face.h"
 #include "audio2emotion/audio2emotion.h"
 #include "audio2x/cuda_utils.h"
-#include <cuda_runtime.h>
 
 #include <mutex>
 #include <atomic>
@@ -21,13 +20,6 @@
 
 // Simple logging macro for timing (to stderr)
 #define A2F_LOG_TIMING(fmt, ...) fprintf(stderr, "[A2F TIMING] " fmt "\n", ##__VA_ARGS__)
-#define A2F_LOG_EMOTION(fmt, ...) fprintf(stderr, "[A2F EMOTION] " fmt "\n", ##__VA_ARGS__)
-
-// Emotion names (indices 0-9)
-static const char* EMOTION_NAMES[10] = {
-    "Amazement", "Angry", "Cheekiness", "Disgust", "Fear",
-    "Grief", "Happy", "OutOfBreath", "Pain", "Sad"
-};
 
 //
 // Thread-local error message storage
@@ -68,7 +60,6 @@ UniquePtr<T> ToUniquePtr(T* ptr) {
 //
 
 struct A2FSession;  // Forward declaration
-struct EmotionCallbackData;  // Forward declaration
 
 struct A2FContext {
     // SDK components
@@ -79,10 +70,9 @@ struct A2FContext {
     // A2E (Audio2Emotion) components
     UniquePtr<nva2e::IClassifierModel::IEmotionModelInfo> a2eModelInfo;
     UniquePtr<nva2e::IEmotionExecutor> emotionExecutor;
+    UniquePtr<nva2e::IEmotionBinder> emotionBinder;
     bool a2eEnabled = false;
     std::string a2eModelPath;
-    bool logEmotions = true;  // Log detected emotions
-    std::unique_ptr<EmotionCallbackData> emotionCallbackData;  // Callback data for emotion logging
 
     // Cached blendshape names
     std::vector<std::string> blendshapeNames;
@@ -163,93 +153,6 @@ static void SdkHostResultsCallback(
     session->callback(session->userData, &frame);
 }
 
-//
-// Emotion callback data structure
-//
-struct EmotionCallbackData {
-    A2FContext* context;
-    nva2x::IEmotionAccumulator* emotionAccumulator;
-
-    // For summary (collected during processing, logged at end)
-    int frameCount = 0;
-    float emotionSums[10] = {0};
-    int topEmotionCounts[10] = {0};
-
-    void reset() {
-        frameCount = 0;
-        for (int i = 0; i < 10; ++i) {
-            emotionSums[i] = 0;
-            topEmotionCounts[i] = 0;
-        }
-    }
-
-    void logSummary() {
-        if (frameCount == 0) return;
-
-        // Find most frequent top emotion
-        int dominantIdx = 0;
-        for (int i = 1; i < 10; ++i) {
-            if (topEmotionCounts[i] > topEmotionCounts[dominantIdx]) {
-                dominantIdx = i;
-            }
-        }
-
-        // Calculate averages
-        float avgEmotions[10];
-        for (int i = 0; i < 10; ++i) {
-            avgEmotions[i] = emotionSums[i] / frameCount;
-        }
-
-        A2F_LOG_EMOTION("Summary (%d frames): Dominant=%s (%d frames, avg=%.2f) | Angry:%.2f Happy:%.2f Sad:%.2f",
-            frameCount, EMOTION_NAMES[dominantIdx], topEmotionCounts[dominantIdx], avgEmotions[dominantIdx],
-            avgEmotions[1], avgEmotions[6], avgEmotions[9]);
-    }
-};
-
-// Emotion callback - just accumulate, no sync (summary logged later)
-static bool EmotionResultsCallback(void* userdata, const nva2e::IEmotionExecutor::Results& results) {
-    auto* data = static_cast<EmotionCallbackData*>(userdata);
-    if (!data || !data->context || !data->emotionAccumulator) {
-        return false;
-    }
-
-    // Accumulate emotions to the accumulator
-    auto err = data->emotionAccumulator->Accumulate(
-        results.trackIndex,
-        results.emotions,
-        results.cudaStream
-    );
-
-    if (err) {
-        return false;
-    }
-
-    // Collect stats for summary (async copy, no sync here)
-    auto* ctx = data->context;
-    size_t emotionSize = results.emotions.Size();
-
-    if (ctx->logEmotions && emotionSize > 0 && emotionSize <= 10) {
-        std::vector<float> hostEmotions(emotionSize);
-        // Note: This copy happens in background, values used for stats only
-        cudaMemcpy(hostEmotions.data(), results.emotions.Data(),
-                   emotionSize * sizeof(float), cudaMemcpyDeviceToHost);
-
-        // Find top emotion and accumulate stats
-        int topIdx = 0;
-        float topVal = hostEmotions[0];
-        for (size_t i = 0; i < emotionSize; ++i) {
-            data->emotionSums[i] += hostEmotions[i];
-            if (hostEmotions[i] > topVal) {
-                topVal = hostEmotions[i];
-                topIdx = static_cast<int>(i);
-            }
-        }
-        data->topEmotionCounts[topIdx]++;
-        data->frameCount++;
-    }
-
-    return true;
-}
 
 //
 // Context Management Functions
@@ -396,17 +299,14 @@ A2F_API A2FErrorCode a2f_context_create(
             }
             ctx->emotionExecutor = ToUniquePtr(rawEmotionExecutor);
 
-            // 5. Set up custom emotion callback (instead of EmotionBinder) to enable logging
-            ctx->emotionCallbackData = std::make_unique<EmotionCallbackData>();
-            ctx->emotionCallbackData->context = ctx.get();
-            ctx->emotionCallbackData->emotionAccumulator = &ctx->bundle->GetEmotionAccumulator(0);
-
-            auto callbackErr = ctx->emotionExecutor->SetResultsCallback(
-                EmotionResultsCallback, ctx->emotionCallbackData.get());
-            if (callbackErr) {
-                SetLastError("Failed to set A2E emotion callback: " + callbackErr.message());
+            // 5. Create EmotionBinder (connects executor output to emotionAccumulator)
+            auto* emotionAcc = &ctx->bundle->GetEmotionAccumulator(0);
+            auto* rawEmotionBinder = nva2e::CreateEmotionBinder(*ctx->emotionExecutor, &emotionAcc, 1);
+            if (!rawEmotionBinder) {
+                SetLastError("Failed to create A2E emotion binder");
                 return A2F_ERROR_A2E_INIT_FAILED;
             }
+            ctx->emotionBinder = ToUniquePtr(rawEmotionBinder);
         }
 
         ctx->initialized = true;
@@ -782,11 +682,6 @@ A2F_API A2FErrorCode a2f_session_finalize(A2FSession* session) {
         A2F_LOG_TIMING("Finalize summary: A2E %.2fms (%d calls), A2F %.2fms (%d calls), Wait %.2fms, Total %.2fms",
             totalA2eMs, a2eExecCount, totalA2fMs, a2fExecCount, waitMs, totalMs);
 
-        // Log emotion summary at the end
-        if (context->a2eEnabled && context->emotionCallbackData) {
-            context->emotionCallbackData->logSummary();
-        }
-
         return A2F_OK;
 
     } catch (const std::exception& e) {
@@ -839,11 +734,6 @@ A2F_API A2FErrorCode a2f_session_reset(A2FSession* session) {
                 SetLastError(err);
                 return A2F_ERROR_EXECUTION_FAILED;
             }
-        }
-
-        // Reset emotion callback stats
-        if (context->emotionCallbackData) {
-            context->emotionCallbackData->reset();
         }
 
         session->audioFinalized = false;
