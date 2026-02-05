@@ -78,6 +78,25 @@ typedef struct {
 } A2FBlendshapeFrame;
 
 /**
+ * Skin parameters for controlling face animation behavior.
+ * These map to SDK's AnimatorSkinParams structure.
+ * Field order matches SDK's nva2f::AnimatorSkinParams.
+ */
+typedef struct {
+    float lower_face_smoothing;    /**< Lower face smoothing (default: 0.001) */
+    float upper_face_smoothing;    /**< Upper face smoothing (default: 0.001) */
+    float lower_face_strength;     /**< Lower face animation strength (default: 1.0) */
+    float upper_face_strength;     /**< Upper face animation strength (default: 1.0) */
+    float face_mask_level;         /**< Face mask level (default: 0.6) */
+    float face_mask_softness;      /**< Face mask softness (default: 0.0085) */
+    float skin_strength;           /**< Overall skin strength (default: 1.0) */
+    float blink_strength;          /**< Blink animation strength (default: 0.75) */
+    float eyelid_open_offset;      /**< Eyelid open offset (default: 0.0) */
+    float lip_open_offset;         /**< Lip open offset (default: 0.0) */
+    float blink_offset;            /**< Blink offset (default: 0.0) */
+} A2FSkinParams;
+
+/**
  * Callback function type for receiving blendshape frames.
  * Called from SDK thread - implementation must be thread-safe.
  *
@@ -188,6 +207,20 @@ A2F_API A2FErrorCode a2f_session_set_callback(
     A2FSession* session,
     A2FFrameCallback callback,
     void* user_data
+);
+
+/**
+ * Set skin parameters for animation control.
+ * Parameters are applied during subsequent execute calls.
+ * Call before pushing audio or before execute for best results.
+ *
+ * @param session Session handle
+ * @param params Skin parameters to apply
+ * @return A2F_OK on success, error code on failure
+ */
+A2F_API A2FErrorCode a2f_session_set_skin_params(
+    A2FSession* session,
+    const A2FSkinParams* params
 );
 
 /**

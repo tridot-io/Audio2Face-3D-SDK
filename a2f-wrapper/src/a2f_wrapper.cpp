@@ -107,6 +107,14 @@ struct A2FSession {
     // Frame buffer for results
     std::vector<float> frameWeights;
 
+    // Skin parameters (cached for apply during execute)
+    nva2f::AnimatorSkinParams skinParams{};
+    bool skinParamsSet = false;
+
+    // Audio tracking for emotion timestamp sync
+    std::atomic<size_t> totalSamplesPushed{0};
+    std::atomic<bool> neutralEmotionAccumulated{false};  // For A2E disabled mode
+
     // State
     std::atomic<bool> audioFinalized{false};
     std::atomic<bool> emotionInitialized{false};
@@ -436,6 +444,34 @@ A2F_API A2FErrorCode a2f_session_set_callback(
     return A2F_OK;
 }
 
+A2F_API A2FErrorCode a2f_session_set_skin_params(
+    A2FSession* session,
+    const A2FSkinParams* params
+) {
+    if (!session || !params) {
+        SetLastError("Invalid argument: session or params is NULL");
+        return A2F_ERROR_INVALID_ARGUMENT;
+    }
+
+    std::lock_guard<std::mutex> lock(session->mutex);
+
+    // Copy params to SDK structure (field order matches)
+    session->skinParams.lowerFaceSmoothing = params->lower_face_smoothing;
+    session->skinParams.upperFaceSmoothing = params->upper_face_smoothing;
+    session->skinParams.lowerFaceStrength = params->lower_face_strength;
+    session->skinParams.upperFaceStrength = params->upper_face_strength;
+    session->skinParams.faceMaskLevel = params->face_mask_level;
+    session->skinParams.faceMaskSoftness = params->face_mask_softness;
+    session->skinParams.skinStrength = params->skin_strength;
+    session->skinParams.blinkStrength = params->blink_strength;
+    session->skinParams.eyelidOpenOffset = params->eyelid_open_offset;
+    session->skinParams.lipOpenOffset = params->lip_open_offset;
+    session->skinParams.blinkOffset = params->blink_offset;
+
+    session->skinParamsSet = true;
+    return A2F_OK;
+}
+
 A2F_API A2FErrorCode a2f_session_push_audio(
     A2FSession* session,
     const float* samples,
@@ -471,6 +507,9 @@ A2F_API A2FErrorCode a2f_session_push_audio(
             SetLastError(err);
             return A2F_ERROR_EXECUTION_FAILED;
         }
+
+        // Track total samples for emotion timestamp sync
+        session->totalSamplesPushed += sample_count;
 
         return A2F_OK;
 
@@ -534,9 +573,35 @@ A2F_API A2FErrorCode a2f_session_execute(
                 auto a2eMs = std::chrono::duration<double, std::milli>(a2eEnd - a2eStart).count();
                 A2F_LOG_TIMING("A2E execute: %d calls, %.2fms", a2eExecCount, a2eMs);
             }
+        } else if (!context->a2eEnabled) {
+            // A2E disabled: continuously feed neutral emotion during streaming
+            // This allows A2F executor to have ready tracks during streaming
+            // Use totalSamplesPushed as timestamp to ensure increasing order
+            auto& emotionAccumulator = context->bundle->GetEmotionAccumulator(session->trackIndex);
+            std::vector<float> neutralEmotion(emotionAccumulator.GetEmotionSize(), 0.0f);
+            auto err = emotionAccumulator.Accumulate(
+                static_cast<int64_t>(session->totalSamplesPushed.load()),
+                nva2x::HostTensorFloatConstView{neutralEmotion.data(), neutralEmotion.size()},
+                context->bundle->GetCudaStream().Data()
+            );
+            if (err) {
+                SetLastError(err);
+                return A2F_ERROR_EXECUTION_FAILED;
+            }
+            session->neutralEmotionAccumulated = true;
         }
 
         auto& executor = context->bundle->GetExecutor();
+
+        // Apply skin params if set (only once, before first execution)
+        if (session->skinParamsSet) {
+            auto err = nva2f::SetExecutorSkinParameters(executor, session->trackIndex, session->skinParams);
+            if (err) {
+                SetLastError(err);
+                return A2F_ERROR_EXECUTION_FAILED;
+            }
+            session->skinParamsSet = false;  // Only apply once
+        }
 
         // Execute for ready tracks
         size_t readyTracks = nva2x::GetNbReadyTracks(executor);
@@ -629,17 +694,21 @@ A2F_API A2FErrorCode a2f_session_finalize(A2FSession* session) {
                     session->emotionAccumulatorClosed = true;
                 }
             } else if (!session->emotionAccumulatorClosed) {
-                // A2E disabled: fallback to neutral emotion for backward compatibility
-                std::vector<float> neutralEmotion(emotionAccumulator.GetEmotionSize(), 0.0f);
-                err = emotionAccumulator.Accumulate(
-                    0,
-                    nva2x::HostTensorFloatConstView{neutralEmotion.data(), neutralEmotion.size()},
-                    context->bundle->GetCudaStream().Data()
-                );
-                if (err) {
-                    SetLastError(err);
-                    return A2F_ERROR_EXECUTION_FAILED;
+                // A2E disabled: handle emotion accumulator
+                if (!session->neutralEmotionAccumulated) {
+                    // Batch mode: no execute() was called, need to add neutral emotion
+                    std::vector<float> neutralEmotion(emotionAccumulator.GetEmotionSize(), 0.0f);
+                    err = emotionAccumulator.Accumulate(
+                        static_cast<int64_t>(session->totalSamplesPushed.load()),
+                        nva2x::HostTensorFloatConstView{neutralEmotion.data(), neutralEmotion.size()},
+                        context->bundle->GetCudaStream().Data()
+                    );
+                    if (err) {
+                        SetLastError(err);
+                        return A2F_ERROR_EXECUTION_FAILED;
+                    }
                 }
+                // Close the accumulator (streaming mode already has emotions from execute())
                 err = emotionAccumulator.Close();
                 if (err) {
                     SetLastError(err);
@@ -739,6 +808,9 @@ A2F_API A2FErrorCode a2f_session_reset(A2FSession* session) {
         session->audioFinalized = false;
         session->emotionInitialized = false;
         session->emotionAccumulatorClosed = false;
+        session->skinParamsSet = false;
+        session->totalSamplesPushed = 0;
+        session->neutralEmotionAccumulated = false;
         session->frameWeights.clear();
 
         return A2F_OK;
