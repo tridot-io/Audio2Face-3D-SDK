@@ -291,12 +291,23 @@ A2F_API A2FErrorCode a2f_context_create(
             const auto sharedAudioAccumulator = &ctx->bundle->GetAudioAccumulator(0);
             emotionParams.sharedAudioAccumulators = &sharedAudioAccumulator;
 
-            // 3. Get classifier-specific parameters (30 FPS output, skip 30 inferences)
+            // 3. Get classifier-specific parameters from config (with defaults)
+            size_t bufferLength = config->a2e_buffer_length > 0
+                ? config->a2e_buffer_length : 10000;
+            size_t frameRateNum = config->a2e_frame_rate_num > 0
+                ? config->a2e_frame_rate_num : 30;
+            size_t frameRateDen = config->a2e_frame_rate_den > 0
+                ? config->a2e_frame_rate_den : 1;
+            size_t inferencesToSkip = config->a2e_inferences_to_skip;  // 0 = every frame
+
+            A2F_LOG_TIMING("A2E params: bufferLength=%zu, frameRate=%zu/%zu, inferencesToSkip=%zu",
+                          bufferLength, frameRateNum, frameRateDen, inferencesToSkip);
+
             auto classifierParams = ctx->a2eModelInfo->GetExecutorCreationParameters(
-                60000,  // bufferLength (samples)
-                30,     // frameRateNumerator
-                1,      // frameRateDenominator
-                30      // inferencesToSkip
+                bufferLength,
+                frameRateNum,
+                frameRateDen,
+                inferencesToSkip
             );
 
             // 4. Create EmotionExecutor
@@ -556,41 +567,6 @@ A2F_API A2FErrorCode a2f_session_execute(
     try {
         using Clock = std::chrono::high_resolution_clock;
 
-        // Execute A2E (Audio2Emotion) first to populate emotion accumulator
-        if (context->a2eEnabled && context->emotionExecutor) {
-            auto a2eStart = Clock::now();
-            int a2eExecCount = 0;
-            while (nva2x::GetNbReadyTracks(*context->emotionExecutor) > 0) {
-                auto err = context->emotionExecutor->Execute(nullptr);
-                if (err) {
-                    SetLastError(err);
-                    return A2F_ERROR_A2E_EXECUTION_FAILED;
-                }
-                a2eExecCount++;
-            }
-            if (a2eExecCount > 0) {
-                auto a2eEnd = Clock::now();
-                auto a2eMs = std::chrono::duration<double, std::milli>(a2eEnd - a2eStart).count();
-                A2F_LOG_TIMING("A2E execute: %d calls, %.2fms", a2eExecCount, a2eMs);
-            }
-        } else if (!context->a2eEnabled) {
-            // A2E disabled: continuously feed neutral emotion during streaming
-            // This allows A2F executor to have ready tracks during streaming
-            // Use totalSamplesPushed as timestamp to ensure increasing order
-            auto& emotionAccumulator = context->bundle->GetEmotionAccumulator(session->trackIndex);
-            std::vector<float> neutralEmotion(emotionAccumulator.GetEmotionSize(), 0.0f);
-            auto err = emotionAccumulator.Accumulate(
-                static_cast<int64_t>(session->totalSamplesPushed.load()),
-                nva2x::HostTensorFloatConstView{neutralEmotion.data(), neutralEmotion.size()},
-                context->bundle->GetCudaStream().Data()
-            );
-            if (err) {
-                SetLastError(err);
-                return A2F_ERROR_EXECUTION_FAILED;
-            }
-            session->neutralEmotionAccumulated = true;
-        }
-
         auto& executor = context->bundle->GetExecutor();
 
         // Apply skin params if set (only once, before first execution)
@@ -603,23 +579,79 @@ A2F_API A2FErrorCode a2f_session_execute(
             session->skinParamsSet = false;  // Only apply once
         }
 
-        // Execute for ready tracks
-        size_t readyTracks = nva2x::GetNbReadyTracks(executor);
-        if (out_pending_frames) {
-            *out_pending_frames = readyTracks;
+        // Low Latency Streaming Pattern (from NVIDIA SDK sample-a2f-a2e-executor)
+        // Priority: A2F first, then A2E only when needed to unblock A2F
+        // This minimizes TTFB by producing frames as soon as possible
+        int a2fExecCount = 0;
+        int a2eExecCount = 0;
+        auto loopStart = Clock::now();
+
+        while (true) {
+            // 1. Try A2F first - this is the output we want
+            size_t a2fReadyTracks = nva2x::GetNbReadyTracks(executor);
+            if (a2fReadyTracks > 0) {
+                auto a2fStart = Clock::now();
+                auto err = executor.Execute(nullptr);
+                auto a2fEnd = Clock::now();
+                auto a2fMs = std::chrono::duration<double, std::milli>(a2fEnd - a2fStart).count();
+                A2F_LOG_TIMING("A2F execute: %.2fms (ready tracks: %zu)", a2fMs, a2fReadyTracks);
+
+                if (err) {
+                    SetLastError(err);
+                    return A2F_ERROR_EXECUTION_FAILED;
+                }
+                a2fExecCount++;
+                continue;  // Check if more A2F can be done
+            }
+
+            // 2. A2F blocked - try A2E to unblock it
+            if (context->a2eEnabled && context->emotionExecutor) {
+                size_t a2eReadyTracks = nva2x::GetNbReadyTracks(*context->emotionExecutor);
+                if (a2eReadyTracks > 0) {
+                    auto a2eStart = Clock::now();
+                    auto err = context->emotionExecutor->Execute(nullptr);
+                    auto a2eEnd = Clock::now();
+                    auto a2eMs = std::chrono::duration<double, std::milli>(a2eEnd - a2eStart).count();
+                    A2F_LOG_TIMING("A2E execute: %.2fms (ready tracks: %zu)", a2eMs, a2eReadyTracks);
+
+                    if (err) {
+                        SetLastError(err);
+                        return A2F_ERROR_A2E_EXECUTION_FAILED;
+                    }
+                    a2eExecCount++;
+                    continue;  // A2E might have unblocked A2F, check again
+                }
+            } else if (!context->a2eEnabled) {
+                // A2E disabled: feed neutral emotion to unblock A2F
+                auto& emotionAccumulator = context->bundle->GetEmotionAccumulator(session->trackIndex);
+                std::vector<float> neutralEmotion(emotionAccumulator.GetEmotionSize(), 0.0f);
+                auto err = emotionAccumulator.Accumulate(
+                    static_cast<int64_t>(session->totalSamplesPushed.load()),
+                    nva2x::HostTensorFloatConstView{neutralEmotion.data(), neutralEmotion.size()},
+                    context->bundle->GetCudaStream().Data()
+                );
+                if (err) {
+                    SetLastError(err);
+                    return A2F_ERROR_EXECUTION_FAILED;
+                }
+                session->neutralEmotionAccumulated = true;
+                // Don't continue here - neutral emotion is instant, no need to loop
+            }
+
+            // 3. Neither A2F nor A2E can run - exit loop
+            break;
         }
 
-        if (readyTracks > 0) {
-            auto a2fStart = Clock::now();
-            auto err = executor.Execute(nullptr);
-            auto a2fEnd = Clock::now();
-            auto a2fMs = std::chrono::duration<double, std::milli>(a2fEnd - a2fStart).count();
-            A2F_LOG_TIMING("A2F execute: %.2fms (ready tracks: %zu)", a2fMs, readyTracks);
+        auto loopEnd = Clock::now();
+        auto loopMs = std::chrono::duration<double, std::milli>(loopEnd - loopStart).count();
+        if (a2fExecCount > 0 || a2eExecCount > 0) {
+            A2F_LOG_TIMING("Execute loop: A2F %d calls, A2E %d calls, total %.2fms",
+                          a2fExecCount, a2eExecCount, loopMs);
+        }
 
-            if (err) {
-                SetLastError(err);
-                return A2F_ERROR_EXECUTION_FAILED;
-            }
+        // Return current ready state
+        if (out_pending_frames) {
+            *out_pending_frames = nva2x::GetNbReadyTracks(executor);
         }
 
         return A2F_OK;

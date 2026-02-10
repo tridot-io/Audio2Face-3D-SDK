@@ -59,6 +59,10 @@ typedef struct {
     size_t identity_index;         /**< Identity index for multi-identity models */
     int use_constant_noise;        /**< 1 = use constant noise for deterministic output */
     int enable_audio2emotion;      /**< 1 = enable Audio2Emotion for eyebrow/expression inference */
+    size_t a2e_buffer_length;       /**< A2E buffer length in samples (0 = use default 10000) */
+    size_t a2e_inferences_to_skip;  /**< A2E inferences to skip (0 = every frame) */
+    size_t a2e_frame_rate_num;      /**< A2E output frame rate numerator (0 = default 30) */
+    size_t a2e_frame_rate_den;      /**< A2E output frame rate denominator (0 = default 1) */
 } A2FContextConfig;
 
 /**
