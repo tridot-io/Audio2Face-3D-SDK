@@ -17,6 +17,7 @@
 #include <thread>
 #include <chrono>
 #include <cstdio>
+#include <cmath>
 
 // Simple logging macro for timing (to stderr)
 #define A2F_LOG_TIMING(fmt, ...) fprintf(stderr, "[A2F TIMING] " fmt "\n", ##__VA_ARGS__)
@@ -155,6 +156,26 @@ static void SdkHostResultsCallback(
     session->frameWeights.resize(frame.weight_count);
     const float* srcData = results.weights.Data();
     std::copy(srcData, srcData + frame.weight_count, session->frameWeights.begin());
+
+    // NaN/Inf safeguard: replace with 0.0 and log once
+    {
+        static std::atomic<int> nanWarnCount{0};
+        bool hasNan = false;
+        for (size_t i = 0; i < frame.weight_count; ++i) {
+            if (std::isnan(session->frameWeights[i]) || std::isinf(session->frameWeights[i])) {
+                session->frameWeights[i] = 0.0f;
+                hasNan = true;
+            }
+        }
+        if (hasNan) {
+            int cnt = nanWarnCount.fetch_add(1);
+            if (cnt < 5) {
+                fprintf(stderr, "[A2F WARNING] NaN/Inf detected in blendshape weights at t=%.3f, replaced with 0.0\n",
+                        frame.time_code);
+            }
+        }
+    }
+
     frame.weights = session->frameWeights.data();
 
     // Invoke user callback
