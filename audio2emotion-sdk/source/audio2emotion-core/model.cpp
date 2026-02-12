@@ -30,7 +30,7 @@ const nva2x::BufferBindingsDescription& IClassifierModel::GetBindingsDescription
   using DimensionType = nva2x::IBufferBindingsDescription::DimensionType;
   static constexpr std::array<nva2x::BindingDescription, 2> kDescriptions = {{
     {"input_values", IOType::INPUT, {{DimensionType::BATCH, DimensionType::DYNAMIC}}},
-    {"output", IOType::OUTPUT, {{DimensionType::BATCH, DimensionType::FIXED}}},
+    {"output", IOType::OUTPUT, {{DimensionType::BATCH, DimensionType::DYNAMIC}}},
   }};
   // Validate everything is as expected at compile-time.
   static_assert(nva2x::IsSorted(kDescriptions.data(), kDescriptions.size()));
