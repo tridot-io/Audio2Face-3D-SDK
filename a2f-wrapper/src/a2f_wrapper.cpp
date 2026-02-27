@@ -19,8 +19,19 @@
 #include <cstdio>
 #include <cmath>
 
-// Simple logging macro for timing (to stderr)
+// Summary-level timing: one-time or per-session logs (always on)
+#define A2F_LOG_TIMING_SUMMARY(fmt, ...) fprintf(stderr, "[A2F TIMING] " fmt "\n", ##__VA_ARGS__)
+
+// Verbose per-execute timing (compile-time flag, default OFF)
+#ifndef A2F_TIMING_VERBOSE
+#define A2F_TIMING_VERBOSE 0
+#endif
+
+#if A2F_TIMING_VERBOSE
 #define A2F_LOG_TIMING(fmt, ...) fprintf(stderr, "[A2F TIMING] " fmt "\n", ##__VA_ARGS__)
+#else
+#define A2F_LOG_TIMING(fmt, ...) ((void)0)
+#endif
 
 //
 // Thread-local error message storage
@@ -321,7 +332,7 @@ A2F_API A2FErrorCode a2f_context_create(
                 ? config->a2e_frame_rate_den : 1;
             size_t inferencesToSkip = config->a2e_inferences_to_skip;  // 0 = every frame
 
-            A2F_LOG_TIMING("A2E params: bufferLength=%zu, frameRate=%zu/%zu, inferencesToSkip=%zu",
+            A2F_LOG_TIMING_SUMMARY("A2E params: bufferLength=%zu, frameRate=%zu/%zu, inferencesToSkip=%zu",
                           bufferLength, frameRateNum, frameRateDen, inferencesToSkip);
 
             auto classifierParams = ctx->a2eModelInfo->GetExecutorCreationParameters(
@@ -801,7 +812,7 @@ A2F_API A2FErrorCode a2f_session_finalize(A2FSession* session) {
         auto finalizeEnd = Clock::now();
         auto totalMs = std::chrono::duration<double, std::milli>(finalizeEnd - finalizeStart).count();
 
-        A2F_LOG_TIMING("Finalize summary: A2E %.2fms (%d calls), A2F %.2fms (%d calls), Wait %.2fms, Total %.2fms",
+        A2F_LOG_TIMING_SUMMARY("Finalize summary: A2E %.2fms (%d calls), A2F %.2fms (%d calls), Wait %.2fms, Total %.2fms",
             totalA2eMs, a2eExecCount, totalA2fMs, a2fExecCount, waitMs, totalMs);
 
         return A2F_OK;

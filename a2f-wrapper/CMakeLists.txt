@@ -35,6 +35,12 @@ target_link_libraries(a2f_wrapper
         CUDA::cudart
 )
 
+# Optional: enable verbose per-execute timing logs (default OFF)
+option(A2F_TIMING_VERBOSE "Enable per-execute timing logs in a2f_wrapper" OFF)
+if(A2F_TIMING_VERBOSE)
+    target_compile_definitions(a2f_wrapper PRIVATE A2F_TIMING_VERBOSE=1)
+endif()
+
 # Export macro for Windows DLL
 target_compile_definitions(a2f_wrapper
     PRIVATE
