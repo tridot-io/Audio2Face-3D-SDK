@@ -224,10 +224,10 @@ std::error_code ModelInfoOwner::Init(const char* path) {
         auto convert_path = [&path](const std::string& jsonPath) -> std::string {
             const auto u8Path = std::filesystem::u8path(jsonPath);
             if (u8Path.is_relative()) {
-                return (std::filesystem::u8path(path).parent_path() / u8Path).string();
+                return (std::filesystem::u8path(path).parent_path() / u8Path).u8string();
             }
             else {
-                return u8Path.string();
+                return u8Path.u8string();
             }
         };
 
@@ -318,10 +318,10 @@ std::error_code ModelInfoOwner::Init(const char* path) {
         auto convert_path = [&path](const std::string& jsonPath) -> std::string {
             const auto u8Path = std::filesystem::u8path(jsonPath);
             if (u8Path.is_relative()) {
-                return (std::filesystem::u8path(path).parent_path() / u8Path).string();
+                return (std::filesystem::u8path(path).parent_path() / u8Path).u8string();
             }
             else {
-                return u8Path.string();
+                return u8Path.u8string();
             }
         };
 

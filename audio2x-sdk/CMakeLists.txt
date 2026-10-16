@@ -3,7 +3,7 @@ add_library(audio2x SHARED)
 
 # Set the output name to match the premake configuration
 set_target_properties(audio2x PROPERTIES
-    OUTPUT_NAME "audio2x"
+    OUTPUT_NAME "audio2x_sdk"  # ProjectAvadot: avoid clashing with ACE NVIGI audio2x.dll in one process
 )
 
 set_target_properties(audio2x PROPERTIES

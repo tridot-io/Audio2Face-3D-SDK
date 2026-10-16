@@ -10,6 +10,7 @@
 
 #include <mutex>
 #include <atomic>
+#include <map>
 #include <vector>
 #include <string>
 #include <memory>
@@ -104,6 +105,9 @@ struct A2FContext {
     // Active session for callback routing
     A2FSession* activeSession = nullptr;
 
+    // Preferred emotion values per track. The A2E executor keeps a view into them across sessions, so they live here.
+    std::map<std::size_t, std::vector<float>> preferredEmotionByTrack;
+
     // State
     bool initialized = false;
 };
@@ -122,6 +126,13 @@ struct A2FSession {
     // Skin parameters (cached for apply during execute)
     nva2f::AnimatorSkinParams skinParams{};
     bool skinParamsSet = false;
+
+    // Tongue parameters (cached for apply during execute)
+    nva2f::AnimatorTongueParams tongueParams{};
+    bool tongueParamsSet = false;
+
+    // a2f_session_set_emotion_params turned the preferred emotion on for this track
+    bool preferredEmotionSet = false;
 
     // Audio tracking for emotion timestamp sync
     std::atomic<size_t> totalSamplesPushed{0};
@@ -515,6 +526,68 @@ A2F_API A2FErrorCode a2f_session_set_skin_params(
     return A2F_OK;
 }
 
+A2F_API A2FErrorCode a2f_session_set_tongue_params(
+    A2FSession* session,
+    float tongue_strength,
+    float tongue_height_offset,
+    float tongue_depth_offset
+) {
+    if (!session) {
+        SetLastError("Invalid argument: session is NULL");
+        return A2F_ERROR_INVALID_ARGUMENT;
+    }
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->tongueParams.tongueStrength = tongue_strength;
+    session->tongueParams.tongueHeightOffset = tongue_height_offset;
+    session->tongueParams.tongueDepthOffset = tongue_depth_offset;
+    session->tongueParamsSet = true;
+    return A2F_OK;
+}
+
+A2F_API A2FErrorCode a2f_session_set_emotion_params(
+    A2FSession* session,
+    const A2FEmotionParams* params
+) {
+    if (!session || !params) {
+        SetLastError("Invalid argument: session or params is NULL");
+        return A2F_ERROR_INVALID_ARGUMENT;
+    }
+    auto* context = session->context;
+    if (!context || !context->a2eEnabled || !context->emotionExecutor) {
+        return A2F_OK;
+    }
+
+    std::lock_guard<std::mutex> lock(session->mutex);
+    try {
+        nva2e::PostProcessParams pp;
+        auto err = nva2e::GetExecutorPostProcessParameters(*context->emotionExecutor, session->trackIndex, pp);
+        if (err) {
+            SetLastError(err);
+            return A2F_ERROR_A2E_EXECUTION_FAILED;
+        }
+        pp.emotionContrast = params->emotion_contrast;
+        pp.maxEmotions = params->max_emotions;
+        pp.liveBlendCoef = params->live_blend_coef;
+        pp.enablePreferredEmotion = params->enable_preferred_emotion != 0;
+        pp.preferredEmotionStrength = params->preferred_emotion_strength;
+        pp.emotionStrength = params->emotion_strength;
+        // The SDK keeps a view: the values must outlive this call and this session, so they live on the context.
+        std::vector<float>& preferred = context->preferredEmotionByTrack[session->trackIndex];
+        preferred.assign(params->preferred_emotion, params->preferred_emotion + 10);
+        pp.preferredEmotion = nva2x::HostTensorFloatConstView{preferred.data(), preferred.size()};
+        session->preferredEmotionSet = pp.enablePreferredEmotion;
+        err = nva2e::SetExecutorPostProcessParameters(*context->emotionExecutor, session->trackIndex, pp);
+        if (err) {
+            SetLastError(err);
+            return A2F_ERROR_A2E_EXECUTION_FAILED;
+        }
+        return A2F_OK;
+    } catch (const std::exception& e) {
+        SetLastError(e.what());
+        return A2F_ERROR_UNKNOWN;
+    }
+}
+
 A2F_API A2FErrorCode a2f_session_push_audio(
     A2FSession* session,
     const float* samples,
@@ -610,6 +683,14 @@ A2F_API A2FErrorCode a2f_session_execute(
             }
             session->skinParamsSet = false;  // Only apply once
         }
+        if (session->tongueParamsSet) {
+            auto err = nva2f::SetExecutorTongueParameters(executor, session->trackIndex, session->tongueParams);
+            if (err) {
+                SetLastError(err);
+                return A2F_ERROR_EXECUTION_FAILED;
+            }
+            session->tongueParamsSet = false;
+        }
 
         // Low Latency Streaming Pattern (from NVIDIA SDK sample-a2f-a2e-executor)
         // Priority: A2F first, then A2E only when needed to unblock A2F
@@ -688,6 +769,30 @@ A2F_API A2FErrorCode a2f_session_execute(
 
         return A2F_OK;
 
+    } catch (const std::exception& e) {
+        SetLastError(std::string("Exception: ") + e.what());
+        return A2F_ERROR_UNKNOWN;
+    }
+}
+
+A2F_API A2FErrorCode a2f_session_wait(A2FSession* session) {
+    if (!session) {
+        SetLastError("Invalid argument: session is NULL");
+        return A2F_ERROR_INVALID_ARGUMENT;
+    }
+    auto* context = session->context;
+    if (!context || !context->bundle) {
+        SetLastError("Context not available");
+        return A2F_ERROR_NOT_INITIALIZED;
+    }
+    try {
+        // The CPU blendshape solve finishes on the SDK job runner; this returns once every frame callback has run.
+        auto err = context->bundle->GetExecutor().Wait(session->trackIndex);
+        if (err) {
+            SetLastError(err);
+            return A2F_ERROR_EXECUTION_FAILED;
+        }
+        return A2F_OK;
     } catch (const std::exception& e) {
         SetLastError(std::string("Exception: ") + e.what());
         return A2F_ERROR_UNKNOWN;
@@ -873,6 +978,7 @@ A2F_API A2FErrorCode a2f_session_reset(A2FSession* session) {
         session->emotionInitialized = false;
         session->emotionAccumulatorClosed = false;
         session->skinParamsSet = false;
+        session->tongueParamsSet = false;
         session->totalSamplesPushed = 0;
         session->neutralEmotionAccumulated = false;
         session->frameWeights.clear();
@@ -896,6 +1002,9 @@ A2F_API A2FErrorCode a2f_session_destroy(A2FSession* session) {
         // Reset accumulators and executor track for the next session
         if (context->bundle) {
             try {
+                // Let in-flight frame callbacks finish: they read this session (callback, frame buffer).
+                context->bundle->GetExecutor().Wait(session->trackIndex);
+
                 // Reset audio accumulator
                 auto& audioAccumulator = context->bundle->GetAudioAccumulator(session->trackIndex);
                 audioAccumulator.Reset();
@@ -911,6 +1020,16 @@ A2F_API A2FErrorCode a2f_session_destroy(A2FSession* session) {
                 // Reset emotion executor if A2E is enabled
                 if (context->a2eEnabled && context->emotionExecutor) {
                     context->emotionExecutor->Reset(session->trackIndex);
+                }
+
+                // Do not carry this session's preferred emotion into the next session on the track. The A2E executor
+                // accepts parameter changes only before execution starts, so this goes after the track reset.
+                if (session->preferredEmotionSet && context->a2eEnabled && context->emotionExecutor) {
+                    nva2e::PostProcessParams pp;
+                    if (!nva2e::GetExecutorPostProcessParameters(*context->emotionExecutor, session->trackIndex, pp)) {
+                        pp.enablePreferredEmotion = false;
+                        nva2e::SetExecutorPostProcessParameters(*context->emotionExecutor, session->trackIndex, pp);
+                    }
                 }
             } catch (...) {
                 // Ignore errors during cleanup

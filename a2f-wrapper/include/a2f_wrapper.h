@@ -101,8 +101,24 @@ typedef struct {
 } A2FSkinParams;
 
 /**
+ * Audio2Emotion post-processing parameters (map to nva2e::PostProcessParams).
+ * preferred_emotion order: amazement, anger, cheekiness, disgust, fear, grief, joy, outofbreath, pain, sadness.
+ */
+typedef struct {
+    float emotion_contrast;            /**< default 1.0 */
+    size_t max_emotions;               /**< default 6 */
+    float live_blend_coef;             /**< smoothing of detected emotion, default 0.7 */
+    int enable_preferred_emotion;      /**< 1 = blend preferred_emotion into the detected emotion */
+    float preferred_emotion_strength;  /**< 0 = detected only, 1 = preferred only */
+    float emotion_strength;            /**< overall strength, default 0.6 */
+    float preferred_emotion[10];
+} A2FEmotionParams;
+
+/**
  * Callback function type for receiving blendshape frames.
- * Called from SDK thread - implementation must be thread-safe.
+ * Called from SDK thread - implementation must be thread-safe. Frames of one session arrive in order, one at a time;
+ * a2f_session_wait / a2f_session_finalize / a2f_session_destroy return after the last pending callback.
+ * The session functions are not synchronized against each other: call them for one session from one thread at a time.
  *
  * @param user_data User-provided data pointer
  * @param frame Pointer to the blendshape frame data
@@ -228,6 +244,26 @@ A2F_API A2FErrorCode a2f_session_set_skin_params(
 );
 
 /**
+ * Set tongue parameters (map to nva2f::AnimatorTongueParams). Applied before the next execute, like skin params.
+ * tongue_strength 0 = no tongue motion (model default 1.3).
+ */
+A2F_API A2FErrorCode a2f_session_set_tongue_params(
+    A2FSession* session,
+    float tongue_strength,
+    float tongue_height_offset,
+    float tongue_depth_offset
+);
+
+/**
+ * Set Audio2Emotion post-processing parameters for this session's track (emotion strength, preferred emotion, ...).
+ * Applies to subsequent A2E executions. No-op (A2F_OK) when A2E is disabled.
+ */
+A2F_API A2FErrorCode a2f_session_set_emotion_params(
+    A2FSession* session,
+    const A2FEmotionParams* params
+);
+
+/**
  * Push audio samples to the session (float32 format).
  * Samples should be 16kHz mono.
  * Thread-safe: can be called from any thread.
@@ -271,6 +307,16 @@ A2F_API A2FErrorCode a2f_session_execute(
     A2FSession* session,
     size_t* out_pending_frames
 );
+
+/**
+ * Wait until every frame of the work started so far has been delivered through the callback.
+ * execute() returns before the last CPU blendshape solve of each batch: that frame's callback runs on an SDK
+ * worker thread. Call this after execute() when the callback must not run outside the caller's own locking.
+ *
+ * @param session Session handle
+ * @return A2F_OK on success, error code on failure
+ */
+A2F_API A2FErrorCode a2f_session_wait(A2FSession* session);
 
 /**
  * Signal end of audio and process all remaining data.
