@@ -47,6 +47,9 @@ static const char* A2F_VERSION = "1.0.1";
 // Solver choice for contexts created next (a2f_set_gpu_blendshape_solver). CPU by default.
 static std::atomic<bool> g_useGpuBlendshapeSolver{false};
 
+// Live contexts. CUDA graph recording assumes a single context in the process (see a2f_set_cuda_graphs).
+static std::atomic<int> g_liveContexts{0};
+
 static void SetLastError(const std::string& msg) {
     g_lastErrorMessage = msg;
 }
@@ -407,6 +410,10 @@ A2F_API A2FErrorCode a2f_context_create(
         }
 
         ctx->initialized = true;
+        if (g_liveContexts.fetch_add(1) > 0 && nva2x::AreCudaGraphsEnabled()) {
+            nva2x::SetCudaGraphsEnabled(false);
+            fprintf(stderr, "[A2F] CUDA graphs turned off: more than one context in the process\n");
+        }
         *out_context = ctx.release();
         return A2F_OK;
 
@@ -428,6 +435,7 @@ A2F_API A2FErrorCode a2f_context_destroy(A2FContext* context) {
     }
 
     delete context;
+    g_liveContexts.fetch_sub(1);
     return A2F_OK;
 }
 
@@ -1096,6 +1104,10 @@ A2F_API A2FErrorCode a2f_set_gpu_blendshape_solver(int enable) {
 }
 
 A2F_API A2FErrorCode a2f_set_cuda_graphs(int enable) {
+    if (enable != 0 && g_liveContexts.load() > 1) {
+        SetLastError("Cannot turn CUDA graphs on: more than one context is alive");
+        return A2F_ERROR_INVALID_ARGUMENT;
+    }
     nva2x::SetCudaGraphsEnabled(enable != 0);
     return A2F_OK;
 }

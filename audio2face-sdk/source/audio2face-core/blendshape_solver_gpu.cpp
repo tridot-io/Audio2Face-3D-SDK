@@ -282,11 +282,13 @@ std::error_code BlendshapeSolverGPU::SolveAsync(nva2x::DeviceTensorFloatConstVie
     }
   }
 
-  const nva2x::DeviceTensorFloatView coreOut =
-    IsSolveCudaGraphEnabled() ? static_cast<nva2x::DeviceTensorFloatView>(mGraphOutWeights) : outWeights;
-  if (!IsSolveCudaGraphEnabled() || mSolveGraphDisabled) {
-    return EnqueueSolveCore(coreOut);
+  // Decide once per frame: the graph path writes into mGraphOutWeights and copies to the caller at the end, the direct
+  // path writes straight into the caller's buffer (also after a failed capture, so frames keep coming).
+  const bool useGraph = IsSolveCudaGraphEnabled() && !mSolveGraphDisabled;
+  if (!useGraph) {
+    return EnqueueSolveCore(outWeights);
   }
+  const nva2x::DeviceTensorFloatView coreOut = mGraphOutWeights;
   if (mSolveGraphStream != mCudaStream) {
     // A graph (or the warm-up before one) belongs to the stream it ran on.
     ReleaseSolveGraph();
@@ -312,6 +314,7 @@ std::error_code BlendshapeSolverGPU::SolveAsync(nva2x::DeviceTensorFloatConstVie
       else {
         (void)cudaGetLastError();
         mSolveGraph = nullptr;
+        // For the life of this solver: a solve that cannot be recorded once will not be recorded after a re-Prepare.
         mSolveGraphDisabled = true;
         std::fprintf(stderr, "[A2X CUDA GRAPH] blendshape solve capture not possible, running kernels directly\n");
       }

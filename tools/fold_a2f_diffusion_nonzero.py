@@ -40,12 +40,13 @@ for name, fill in fills.items():
     r = eval_nz(fill); print(name, "fill", fill, "-> results over batch 1..8:", r)
     assert len(r) == 1
     vals[name] = np.array(list(r)[0][1], dtype=np.int64).reshape(list(r)[0][0])
-# Replace each NonZero node by a Constant producing the same output name.
+# Replace each NonZero node by a Constant producing the same output name. The new name avoids "NonZero": the SDK
+# refuses to record engines whose layer list mentions it.
 new_nodes = []
 for n in g.node:
     if n.op_type == "NonZero" and n.name in vals:
-        new_nodes.append(helper.make_node("Constant", [], list(n.output), name=n.name + "_folded",
-                                          value=numpy_helper.from_array(vals[n.name], n.name + "_folded_value")))
+        new_nodes.append(helper.make_node("Constant", [], list(n.output), name=n.name.replace("NonZero", "TimestepIndex") + "_folded",
+                                          value=numpy_helper.from_array(vals[n.name], n.name.replace("NonZero", "TimestepIndex") + "_folded_value")))
         print("replaced", n.name, "with constant", vals[n.name].tolist())
     else:
         new_nodes.append(n)

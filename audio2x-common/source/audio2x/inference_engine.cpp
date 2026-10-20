@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 
 namespace nva2x {
@@ -259,21 +260,19 @@ std::error_code InferenceEngine::Init(const void *networkData, size_t networkDat
   _context = _engine->createExecutionContext();
   A2X_CHECK_ERROR_WITH_MSG(nullptr != _context, "Unable to create TensorRT Execution Context", ErrorCode::eCreateExecutionContextFailed);
 
-  // Layer names survive in every engine (kLAYER_NAMES_ONLY). A NonZero layer, or the device-to-host shape copy TensorRT
-  // adds for it, means the engine cannot be recorded as a CUDA graph. Unknown = treat as data-dependent.
-  _hasDataDependentShapes = true;
-  // One call for the whole engine: asking layer by layer took over a minute on the A2F engine (2026-10-20).
-  if (nvinfer1::IEngineInspector* inspector = _engine->createEngineInspector()) {
-    const char* info = inspector->getEngineInformation(nvinfer1::LayerInformationFormat::kONELINE);
-    if (info != nullptr) {
-      _hasDataDependentShapes = std::strstr(info, "NonZero") != nullptr || std::strstr(info, "ShapeHostCopy") != nullptr;
-    }
-    delete inspector;
+  _initialized = true;
+  if (_cudaGraphAllowed && IsCudaGraphEnabled()) {
+    (void)IsRecordable();
   }
 
-  _initialized = true;
-
   return ErrorCode::eSuccess;
+}
+
+void InferenceEngine::SetCudaGraphAllowed(bool allowed) {
+  _cudaGraphAllowed = allowed;
+  if (_initialized && _cudaGraphAllowed && IsCudaGraphEnabled()) {
+    (void)IsRecordable();
+  }
 }
 
 std::int64_t InferenceEngine::GetMaxBatchSize(const IBufferBindingsDescription& bindingsDescription) const {
@@ -428,6 +427,9 @@ std::error_code InferenceEngine::CheckBindings(const IBufferBindingsDescription&
 }
 
 std::error_code InferenceEngine::BindBuffers(const IBufferBindings& bindings, int batchSize) const {
+  // A failed bind leaves no signature that could match a recorded graph.
+  _bindingSignature = 0;
+  _shapeSignature = 0;
   const auto& description = bindings.GetDescription();
   for (std::size_t i = 0, count = description.Count(); i < count; ++i) {
     const auto descriptionType = description.GetIOType(i);
@@ -526,25 +528,91 @@ std::error_code InferenceEngine::BindBuffers(const IBufferBindings& bindings, in
 
   // Signature of the bound addresses and shapes: a captured CUDA graph is only valid for these.
   std::uint64_t signature = 0xcbf29ce484222325ull;
-  auto mix = [&signature](std::uint64_t value) { signature = (signature ^ value) * 0x100000001b3ull; };
-  mix(static_cast<std::uint64_t>(batchSize));
+  std::uint64_t shapeSignature = 0xcbf29ce484222325ull;
+  auto mix = [](std::uint64_t& hash, std::uint64_t value) { hash = (hash ^ value) * 0x100000001b3ull; };
+  mix(shapeSignature, static_cast<std::uint64_t>(batchSize));
   for (std::size_t i = 0, count = description.Count(); i < count; ++i) {
     const auto name = description.GetName(i);
-    mix(reinterpret_cast<std::uintptr_t>(_context->getTensorAddress(name)));
+    mix(signature, reinterpret_cast<std::uintptr_t>(_context->getTensorAddress(name)));
     const nvinfer1::Dims dims = _context->getTensorShape(name);
-    mix(static_cast<std::uint64_t>(dims.nbDims));
+    mix(shapeSignature, static_cast<std::uint64_t>(dims.nbDims));
     for (std::int32_t j = 0; j < dims.nbDims; ++j) {
-      mix(static_cast<std::uint64_t>(dims.d[j]));
+      mix(shapeSignature, static_cast<std::uint64_t>(dims.d[j]));
     }
   }
+  mix(signature, shapeSignature);
   _bindingSignature = static_cast<std::size_t>(signature);
+  _shapeSignature = static_cast<std::size_t>(shapeSignature);
 
   return ErrorCode::eSuccess;
 }
 
+namespace {
+
+// True when the inspector output lists at least one layer. kONELINE gives "Layers:\n<layer>\n...",
+// kJSON gives {"Layers": ["<layer>", ...]}. Without a list the engine's contents are unknown.
+bool HasLayerList(const char* info) {
+  if (info == nullptr) {
+    return false;
+  }
+  auto skipSpace = [](const char* p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+      ++p;
+    }
+    return p;
+  };
+  if (const char* plain = std::strstr(info, "Layers:")) {
+    const char* p = skipSpace(plain + 7);
+    return *p != '\0' && std::strncmp(p, "Bindings", 8) != 0;
+  }
+  const char* key = std::strstr(info, "\"Layers\"");
+  if (key == nullptr) {
+    return false;
+  }
+  const char* p = key + 8;
+  for (const char expected : {':', '[', '"'}) {
+    p = skipSpace(p);
+    if (*p != expected) {
+      return false;
+    }
+    ++p;
+  }
+  return true;
+}
+
+} // namespace
+
+bool InferenceEngine::IsRecordable() const {
+  if (!_engineInspected) {
+    _engineInspected = true;
+    _engineRecordable = false;
+    // One call for the whole engine: asking layer by layer took over a minute on the A2F engine (2026-10-20).
+    const char* reason = "no engine inspector";
+    if (nvinfer1::IEngineInspector* inspector = _engine->createEngineInspector()) {
+      const char* info = inspector->getEngineInformation(nvinfer1::LayerInformationFormat::kONELINE);
+      if (!HasLayerList(info)) {
+        reason = "no layer list in the engine information";
+        std::fprintf(stderr, "[A2X CUDA GRAPH] engine information starts with: %.160s\n", info != nullptr ? info : "(null)");
+      }
+      else if (std::strstr(info, "NonZero") != nullptr || std::strstr(info, "ShapeHostCopy") != nullptr) {
+        reason = "data-dependent shapes (NonZero)";
+      }
+      else {
+        _engineRecordable = true;
+        reason = "ok";
+      }
+      delete inspector;
+    }
+    std::fprintf(stderr, "[A2X CUDA GRAPH] engine %s: %s\n", _engineRecordable ? "recordable" : "not recorded", reason);
+  }
+  return _engineRecordable;
+}
+
 std::error_code InferenceEngine::Run(cudaStream_t cudaStream) const {
-  const bool useGraphs = _cudaGraphAllowed && !_hasDataDependentShapes && IsCudaGraphEnabled() && !_cudaGraphDisabled;
-  if (useGraphs) {
+  const bool useGraphs = _cudaGraphAllowed && IsCudaGraphEnabled() && !_cudaGraphDisabled && IsRecordable();
+  const bool sameShapesAsLastRun = _shapeSignature == _lastRunShapeSignature;
+  _lastRunShapeSignature = _shapeSignature;
+  if (useGraphs && sameShapesAsLastRun) {
     for (const auto& entry : _cudaGraphs) {
       if (entry.signature == _bindingSignature) {
         A2X_CHECK_ERROR_WITH_MSG(cudaGraphLaunch(entry.exec, cudaStream) == cudaSuccess,
@@ -611,6 +679,10 @@ void InferenceEngine::ReleaseCudaGraphs() {
   _seenSignatures.clear();
   _cudaGraphDisabled = false;
   _bindingSignature = 0;
+  _shapeSignature = 0;
+  _lastRunShapeSignature = 0;
+  _engineInspected = false;
+  _engineRecordable = false;
 }
 
 void InferenceEngine::Destroy() {

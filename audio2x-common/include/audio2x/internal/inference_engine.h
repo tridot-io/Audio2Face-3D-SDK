@@ -199,8 +199,8 @@ public:
   // Opt in to CUDA graph replay (see SetCudaGraphsEnabled). Kept across Init(). An engine with data-dependent shapes is
   // never recorded even when allowed: its NonZero layer reads a device-to-host copy that a capture does not run, which
   // crashed the game (2026-10-20, A2F diffusion engine built from the original ONNX). Init() looks for such layers.
-  void SetCudaGraphAllowed(bool allowed) { _cudaGraphAllowed = allowed; }
-  bool HasDataDependentShapes() const { return _hasDataDependentShapes; }
+  // When graphs are already on, the engine is inspected here (during model loading) rather than on the first inference.
+  void SetCudaGraphAllowed(bool allowed);
 
 private:
   // CUDA graph replay of enqueueV3 (env A2X_CUDA_GRAPH=1). A graph is valid only for the tensor addresses and shapes it
@@ -211,6 +211,9 @@ private:
   };
   void TryCaptureCudaGraph(cudaStream_t cudaStream) const;
   void ReleaseCudaGraphs();
+  // Inspects the engine once, on first use with graphs on: recordable only when its layer list is present and has no
+  // NonZero / device-to-host shape copy. Unknown counts as not recordable.
+  bool IsRecordable() const;
 
   nvinfer1::IRuntime *_runtime;
   nvinfer1::ICudaEngine *_engine;
@@ -218,11 +221,16 @@ private:
   bool _initialized;
 
   mutable std::size_t _bindingSignature{0};
+  // Shapes and batch only. A graph is replayed only when the previous run had the same shapes: after a shape change
+  // TensorRT must flush deferred work in an eager enqueueV3 first.
+  mutable std::size_t _shapeSignature{0};
+  mutable std::size_t _lastRunShapeSignature{0};
   mutable std::vector<std::size_t> _seenSignatures;
   mutable std::vector<CudaGraphEntry> _cudaGraphs;
   mutable bool _cudaGraphDisabled{false};
   bool _cudaGraphAllowed{false};
-  bool _hasDataDependentShapes{false};
+  mutable bool _engineInspected{false};
+  mutable bool _engineRecordable{false};
 };
 
 } // namespace nva2x

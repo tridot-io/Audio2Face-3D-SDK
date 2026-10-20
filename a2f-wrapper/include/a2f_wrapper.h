@@ -158,12 +158,17 @@ A2F_API A2FErrorCode a2f_context_create(
 A2F_API A2FErrorCode a2f_set_gpu_blendshape_solver(int enable);
 
 /**
- * Record the A2E inference and the GPU blendshape solve once as CUDA graphs and replay them (process-wide).
- * The output is identical; the A2F diffusion engine cannot be recorded and keeps running directly.
+ * Record the TensorRT inferences and the GPU blendshape solve once as CUDA graphs and replay them (process-wide).
+ * The output is identical. Each engine is checked once: one with data-dependent layers (NonZero, e.g. the original A2F
+ * diffusion engine) or without a layer list keeps running directly; the A2F diffusion engine rebuilt from
+ * tools/fold_a2f_diffusion_nonzero.py is recorded.
+ * Requirements while on: one context in the process (creating a second context turns graphs off, and turning them on
+ * with more than one context fails), and audio push and execute on the same thread (a push from another thread during
+ * a recording would be captured instead of run).
  * 0 (default): off. Added in wrapper 1.0.1 (ondevice branch); check the export, not the version.
  *
  * @param enable 1 to turn CUDA graphs on, 0 to turn them off
- * @return A2F_OK
+ * @return A2F_OK, or A2F_ERROR_INVALID_ARGUMENT when turning on with more than one live context
  */
 A2F_API A2FErrorCode a2f_set_cuda_graphs(int enable);
 
