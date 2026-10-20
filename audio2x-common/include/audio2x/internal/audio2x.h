@@ -71,6 +71,8 @@ ICudaStream* CreateDefaultCudaStream();
 
 // cuda_utils.h
 std::error_code SetCudaDeviceIfNeeded(int device);
+void SetCudaGraphsEnabled(bool enabled);
+bool AreCudaGraphsEnabled();
 
 // emotion_accumulator.h
 IEmotionAccumulator* CreateEmotionAccumulator(

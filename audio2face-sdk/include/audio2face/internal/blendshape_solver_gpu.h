@@ -49,6 +49,11 @@ private:
   struct WorkingBufferGPU;
 
   std::error_code Cache(PrepareData& data) override;
+  // Everything after the input copy, writing into mGraphOutWeights. Recorded once as a CUDA graph (env A2X_CUDA_GRAPH=1)
+  // and replayed per frame: the input and output addresses change per frame, so they are copied outside the graph.
+  std::error_code EnqueueSolveCore(nva2x::DeviceTensorFloatView outWeights);
+  void ReleaseSolveGraph();
+
   std::unique_ptr<BlendshapeSolverGPUCache> mCache;
   std::unique_ptr<WorkingBufferGPU> mWorkingBufferGPU;
 
@@ -58,6 +63,13 @@ private:
   nva2x::DeviceTensorFloat d_Offsets;
   // temporal smoothing
   nva2x::DeviceTensorFloat mPrevWeights;
+
+  // CUDA graph of EnqueueSolveCore. Invalidated when the cache, multipliers, offsets or stream change.
+  nva2x::DeviceTensorFloat mGraphOutWeights;
+  cudaGraphExec_t mSolveGraph = nullptr;
+  cudaStream_t mSolveGraphStream = nullptr;
+  bool mSolveGraphDisabled = false;
+  bool mSolveGraphWarm = false;
 };
 
 } // namespace nva2f

@@ -32,10 +32,25 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
 namespace nva2x {
+
+namespace {
+
+bool IsCudaGraphEnabled() {
+  return internal::AreCudaGraphsEnabled();
+}
+
+// Graphs kept per engine. The A2F diffusion state buffers alternate between two addresses, so a few are needed.
+constexpr std::size_t kMaxCudaGraphsPerEngine = 4;
+constexpr std::size_t kMaxSeenSignatures = 8;
+
+} // namespace
 
 IBufferBindingsDescription::~IBufferBindingsDescription() = default;
 IBufferBindings::~IBufferBindings() = default;
@@ -243,6 +258,18 @@ std::error_code InferenceEngine::Init(const void *networkData, size_t networkDat
 
   _context = _engine->createExecutionContext();
   A2X_CHECK_ERROR_WITH_MSG(nullptr != _context, "Unable to create TensorRT Execution Context", ErrorCode::eCreateExecutionContextFailed);
+
+  // Layer names survive in every engine (kLAYER_NAMES_ONLY). A NonZero layer, or the device-to-host shape copy TensorRT
+  // adds for it, means the engine cannot be recorded as a CUDA graph. Unknown = treat as data-dependent.
+  _hasDataDependentShapes = true;
+  // One call for the whole engine: asking layer by layer took over a minute on the A2F engine (2026-10-20).
+  if (nvinfer1::IEngineInspector* inspector = _engine->createEngineInspector()) {
+    const char* info = inspector->getEngineInformation(nvinfer1::LayerInformationFormat::kONELINE);
+    if (info != nullptr) {
+      _hasDataDependentShapes = std::strstr(info, "NonZero") != nullptr || std::strstr(info, "ShapeHostCopy") != nullptr;
+    }
+    delete inspector;
+  }
 
   _initialized = true;
 
@@ -497,14 +524,93 @@ std::error_code InferenceEngine::BindBuffers(const IBufferBindings& bindings, in
     );
   }
 
+  // Signature of the bound addresses and shapes: a captured CUDA graph is only valid for these.
+  std::uint64_t signature = 0xcbf29ce484222325ull;
+  auto mix = [&signature](std::uint64_t value) { signature = (signature ^ value) * 0x100000001b3ull; };
+  mix(static_cast<std::uint64_t>(batchSize));
+  for (std::size_t i = 0, count = description.Count(); i < count; ++i) {
+    const auto name = description.GetName(i);
+    mix(reinterpret_cast<std::uintptr_t>(_context->getTensorAddress(name)));
+    const nvinfer1::Dims dims = _context->getTensorShape(name);
+    mix(static_cast<std::uint64_t>(dims.nbDims));
+    for (std::int32_t j = 0; j < dims.nbDims; ++j) {
+      mix(static_cast<std::uint64_t>(dims.d[j]));
+    }
+  }
+  _bindingSignature = static_cast<std::size_t>(signature);
+
   return ErrorCode::eSuccess;
 }
 
 std::error_code InferenceEngine::Run(cudaStream_t cudaStream) const {
+  const bool useGraphs = _cudaGraphAllowed && !_hasDataDependentShapes && IsCudaGraphEnabled() && !_cudaGraphDisabled;
+  if (useGraphs) {
+    for (const auto& entry : _cudaGraphs) {
+      if (entry.signature == _bindingSignature) {
+        A2X_CHECK_ERROR_WITH_MSG(cudaGraphLaunch(entry.exec, cudaStream) == cudaSuccess,
+                                 "Unable to launch CUDA graph", ErrorCode::eEnqueueFailed);
+        return ErrorCode::eSuccess;
+      }
+    }
+  }
+
   A2X_CHECK_ERROR_WITH_MSG(_context->enqueueV3(cudaStream),
                            "Unable to enqueue TensorRT inference", ErrorCode::eEnqueueFailed);
 
+  if (useGraphs) {
+    // Capture on the second run with the same bindings: the first enqueueV3 after a binding change flushes TensorRT's
+    // deferred shape work, which is not meant to be captured. The capture only records; this run already executed.
+    const auto seen = std::find(_seenSignatures.begin(), _seenSignatures.end(), _bindingSignature);
+    if (seen != _seenSignatures.end()) {
+      TryCaptureCudaGraph(cudaStream);
+    }
+    else {
+      if (_seenSignatures.size() >= kMaxSeenSignatures) {
+        _seenSignatures.erase(_seenSignatures.begin());
+      }
+      _seenSignatures.push_back(_bindingSignature);
+    }
+  }
+
   return ErrorCode::eSuccess;
+}
+
+void InferenceEngine::TryCaptureCudaGraph(cudaStream_t cudaStream) const {
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t exec = nullptr;
+  bool captured = cudaStreamBeginCapture(cudaStream, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+  if (captured) {
+    const bool enqueued = _context->enqueueV3(cudaStream);
+    captured = (cudaStreamEndCapture(cudaStream, &graph) == cudaSuccess) && enqueued && graph != nullptr;
+  }
+  captured = captured && cudaGraphInstantiate(&exec, graph, 0) == cudaSuccess;
+  if (graph != nullptr) {
+    cudaGraphDestroy(graph);
+  }
+  if (!captured) {
+    // Loops, conditionals or data-dependent shapes cannot be captured: keep using enqueueV3 for this engine.
+    (void)cudaGetLastError();
+    _cudaGraphDisabled = true;
+    _seenSignatures.clear();
+    std::fprintf(stderr, "[A2X CUDA GRAPH] capture not possible for this engine, using enqueueV3\n");
+    return;
+  }
+  if (_cudaGraphs.size() >= kMaxCudaGraphsPerEngine) {
+    cudaGraphExecDestroy(_cudaGraphs.front().exec);
+    _cudaGraphs.erase(_cudaGraphs.begin());
+  }
+  _cudaGraphs.push_back({_bindingSignature, exec});
+  std::fprintf(stderr, "[A2X CUDA GRAPH] captured graph %zu for this engine\n", _cudaGraphs.size());
+}
+
+void InferenceEngine::ReleaseCudaGraphs() {
+  for (const auto& entry : _cudaGraphs) {
+    cudaGraphExecDestroy(entry.exec);
+  }
+  _cudaGraphs.clear();
+  _seenSignatures.clear();
+  _cudaGraphDisabled = false;
+  _bindingSignature = 0;
 }
 
 void InferenceEngine::Destroy() {
@@ -513,6 +619,7 @@ void InferenceEngine::Destroy() {
 }
 
 std::error_code InferenceEngine::Deallocate() {
+  ReleaseCudaGraphs();
   if (_context != nullptr) {
     A2X_LOG_DEBUG("Destroying TensorRT context");
     delete _context;

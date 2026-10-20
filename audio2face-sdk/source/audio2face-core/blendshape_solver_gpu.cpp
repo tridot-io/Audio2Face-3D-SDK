@@ -28,6 +28,8 @@
 #include "audio2face/internal/logger.h"
 #include "audio2face/internal/eigen_utils.h"
 #include "audio2x/cuda_utils.h"
+
+#include <cstdio>
 #include "audio2x/error.h"
 
 #include "audio2x/internal/nvtx_trace.h"
@@ -139,33 +141,56 @@ BlendshapeSolverGPU::BlendshapeSolverGPU() : BlendshapeSolverBase() {
 }
 
 BlendshapeSolverGPU::~BlendshapeSolverGPU() {
+  ReleaseSolveGraph();
+}
+
+namespace {
+
+bool IsSolveCudaGraphEnabled() {
+  return nva2x::AreCudaGraphsEnabled();
+}
+
+} // namespace
+
+void BlendshapeSolverGPU::ReleaseSolveGraph() {
+  if (mSolveGraph != nullptr) {
+    cudaGraphExecDestroy(mSolveGraph);
+    mSolveGraph = nullptr;
+  }
+  mSolveGraphStream = nullptr;
+  mSolveGraphWarm = false;
 }
 
 std::error_code BlendshapeSolverGPU::SetMultipliers(nva2x::HostTensorFloatConstView multipliers) {
+  ReleaseSolveGraph();
   CHECK_NO_ERROR(BlendshapeSolverBase::SetMultipliers(multipliers));
   CHECK_RESULT(d_Multipliers.Init(nva2x::ToConstView(mConfig.multipliers), mCudaStream));
   return nva2x::ErrorCode::eSuccess;
 }
 
 std::error_code BlendshapeSolverGPU::SetMultiplier(const char* poseName, const float val) {
+  ReleaseSolveGraph();
   CHECK_NO_ERROR(BlendshapeSolverBase::SetMultiplier(poseName, val));
   CHECK_RESULT(d_Multipliers.Init(nva2x::ToConstView(mConfig.multipliers), mCudaStream));
   return nva2x::ErrorCode::eSuccess;
 }
 
 std::error_code BlendshapeSolverGPU::SetOffsets(nva2x::HostTensorFloatConstView offsets) {
+  ReleaseSolveGraph();
   CHECK_NO_ERROR(BlendshapeSolverBase::SetOffsets(offsets));
   CHECK_RESULT(d_Offsets.Init(nva2x::ToConstView(mConfig.offsets), mCudaStream));
   return nva2x::ErrorCode::eSuccess;
 }
 
 std::error_code BlendshapeSolverGPU::SetOffset(const char* poseName, const float val) {
+  ReleaseSolveGraph();
   CHECK_NO_ERROR(BlendshapeSolverBase::SetOffset(poseName, val));
   CHECK_RESULT(d_Offsets.Init(nva2x::ToConstView(mConfig.offsets), mCudaStream));
   return nva2x::ErrorCode::eSuccess;
 }
 
 std::error_code BlendshapeSolverGPU::Cache(PrepareData& data) {
+  ReleaseSolveGraph();
   mCache = std::make_unique<BlendshapeSolverGPUCache>(data.numVertexPositions, data.numBlendshapes, data.activeBlendshapeIndices.size(), data.cancelPairs.size());
   if (!data.activeBlendshapeIndices.empty()) {
     CUDA_CHECK_ERROR(cudaMemcpyAsync(mCache->d_activeBlendshapeIndices, data.activeBlendshapeIndices.data(),
@@ -212,6 +237,7 @@ std::error_code BlendshapeSolverGPU::Cache(PrepareData& data) {
   CHECK_RESULT(d_Offsets.Init(nva2x::ToConstView(mConfig.offsets), mCudaStream));
   mWorkingBufferGPU = std::make_unique<WorkingBufferGPU>(data.numVertexPositions, data.numBlendshapes, mCudaStream);
   CHECK_RESULT(mPrevWeights.Allocate(mCache->numBlendshapes));
+  CHECK_RESULT(mGraphOutWeights.Allocate(mRawData.numBlendshapePoses));
   return nva2x::ErrorCode::eSuccess;
 }
 
@@ -239,7 +265,6 @@ std::error_code BlendshapeSolverGPU::SolveAsync(nva2x::DeviceTensorFloatConstVie
   }
   // Extract variables for easier reference
   const size_t numVertexPositions = mCache->numVertexPositions;
-  const size_t numBlendshapes = mCache->numBlendshapes;
 
   CHECK_ERROR_WITH_MSG(targetPoseDevice.Size() == mRawData.numVertexPositions, "Mismatched size for pose in BlendshapeSolverGPU", nva2x::ErrorCode::eMismatch);
   CHECK_ERROR_WITH_MSG(outWeights.Size() == mRawData.numBlendshapePoses, "Mismatched size for output weights in BlendshapeSolverGPU", nva2x::ErrorCode::eMismatch);
@@ -254,6 +279,56 @@ std::error_code BlendshapeSolverGPU::SolveAsync(nva2x::DeviceTensorFloatConstVie
       } else {
         CHECK_RESULT(nva2x::CopyDeviceToDevice(mWorkingBufferGPU->targetDeltaDevice, targetPoseDevice, mCudaStream));
       }
+    }
+  }
+
+  const nva2x::DeviceTensorFloatView coreOut =
+    IsSolveCudaGraphEnabled() ? static_cast<nva2x::DeviceTensorFloatView>(mGraphOutWeights) : outWeights;
+  if (!IsSolveCudaGraphEnabled() || mSolveGraphDisabled) {
+    return EnqueueSolveCore(coreOut);
+  }
+  if (mSolveGraphStream != mCudaStream) {
+    // A graph (or the warm-up before one) belongs to the stream it ran on.
+    ReleaseSolveGraph();
+    mSolveGraphStream = mCudaStream;
+  }
+  if (mSolveGraph == nullptr) {
+    CHECK_NO_ERROR(EnqueueSolveCore(coreOut));
+    if (mSolveGraphWarm) {
+      // Second frame on this stream: record the core once (the first eager run let cuBLAS set itself up).
+      cudaGraph_t graph = nullptr;
+      bool captured = cudaStreamBeginCapture(mCudaStream, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+      if (captured) {
+        const auto coreErr = EnqueueSolveCore(coreOut);
+        captured = (cudaStreamEndCapture(mCudaStream, &graph) == cudaSuccess) && !coreErr && graph != nullptr;
+      }
+      captured = captured && cudaGraphInstantiate(&mSolveGraph, graph, 0) == cudaSuccess;
+      if (graph != nullptr) {
+        cudaGraphDestroy(graph);
+      }
+      if (captured) {
+        std::fprintf(stderr, "[A2X CUDA GRAPH] captured blendshape solve graph\n");
+      }
+      else {
+        (void)cudaGetLastError();
+        mSolveGraph = nullptr;
+        mSolveGraphDisabled = true;
+        std::fprintf(stderr, "[A2X CUDA GRAPH] blendshape solve capture not possible, running kernels directly\n");
+      }
+    }
+    mSolveGraphWarm = true;
+  }
+  else {
+    CUDA_CHECK_ERROR(cudaGraphLaunch(mSolveGraph, mCudaStream), nva2x::ErrorCode::eCudaKernelError);
+  }
+  return nva2x::CopyDeviceToDevice(outWeights, mGraphOutWeights, mCudaStream);
+}
+
+std::error_code BlendshapeSolverGPU::EnqueueSolveCore(nva2x::DeviceTensorFloatView outWeights) {
+  const size_t numVertexPositions = mCache->numVertexPositions;
+  const size_t numBlendshapes = mCache->numBlendshapes;
+  {
+    {
       const static float alpha = -1.0f;
       cublasSaxpy(mCublasHandle,
                   numVertexPositions,

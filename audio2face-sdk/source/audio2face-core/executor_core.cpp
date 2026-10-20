@@ -129,6 +129,8 @@ std::error_code GeometryExecutorCoreBase::BaseInit(
         _inferenceEngine.Init(networkData, networkDataSize),
         "Unable to initialize inference engine"
     );
+    // CUDA graph replay; the engine itself refuses when it still has data-dependent layers (original diffusion ONNX).
+    _inferenceEngine.SetCudaGraphAllowed(true);
     A2F_CHECK_RESULT_WITH_MSG(
         _inferenceEngine.CheckBindings(bindingsDescription),
             "Mismatch in bindings on the inference engine"

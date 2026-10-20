@@ -25,6 +25,33 @@
 
 #include <cuda_runtime_api.h>
 
+#include <atomic>
+#include <cstdlib>
+
+namespace {
+
+// -1 = not set: follow the A2X_CUDA_GRAPH environment variable.
+std::atomic<int> gCudaGraphsEnabled{-1};
+
+bool CudaGraphsEnabledByEnvironment() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("A2X_CUDA_GRAPH");
+    return env != nullptr && env[0] == '1';
+  }();
+  return enabled;
+}
+
+} // namespace
+
+void nva2x::internal::SetCudaGraphsEnabled(bool enabled) {
+  gCudaGraphsEnabled.store(enabled ? 1 : 0);
+}
+
+bool nva2x::internal::AreCudaGraphsEnabled() {
+  const int value = gCudaGraphsEnabled.load();
+  return value < 0 ? CudaGraphsEnabledByEnvironment() : value == 1;
+}
+
 std::error_code nva2x::internal::SetCudaDeviceIfNeeded(int device) {
   int current_device;
   A2X_CUDA_CHECK_ERROR(cudaGetDevice(&current_device), ErrorCode::eCudaDeviceGetError);

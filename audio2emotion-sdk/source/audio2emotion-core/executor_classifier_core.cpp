@@ -100,6 +100,8 @@ std::error_code EmotionExecutorCore::Init(
         _inferenceEngine.Init(classifierParams.networkData, classifierParams.networkDataSize),
         "Unable to initialize inference engine"
     );
+    // The A2E classifier has fixed shapes per batch size and no data-dependent layers: safe to record as a CUDA graph.
+    _inferenceEngine.SetCudaGraphAllowed(true);
     const auto& bindingsDescription = GetBindingsDescription();
     A2E_CHECK_RESULT_WITH_MSG(
         _inferenceEngine.CheckBindings(bindingsDescription),

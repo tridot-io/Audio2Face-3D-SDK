@@ -30,4 +30,11 @@ namespace nva2x {
 // to minimize the overhead of setting the device when it's already set.
 AUDIO2X_SDK_EXPORT std::error_code SetCudaDeviceIfNeeded(int device);
 
+// CUDA graph replay of the TensorRT inference engines and of the GPU blendshape solve. Each is recorded once per set of
+// bindings and replayed afterwards; an engine that cannot be recorded (loops, data-dependent shapes) keeps running
+// directly. Off by default; the environment variable A2X_CUDA_GRAPH=1 also turns it on. Applies to work enqueued after
+// the call.
+AUDIO2X_SDK_EXPORT void SetCudaGraphsEnabled(bool enabled);
+AUDIO2X_SDK_EXPORT bool AreCudaGraphsEnabled();
+
 } // namespace nva2x

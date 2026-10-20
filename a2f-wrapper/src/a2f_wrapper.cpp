@@ -19,6 +19,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cmath>
+#include <cstdint>
+#include <cuda_runtime_api.h>
 
 // Summary-level timing: one-time or per-session logs (always on)
 #define A2F_LOG_TIMING_SUMMARY(fmt, ...) fprintf(stderr, "[A2F TIMING] " fmt "\n", ##__VA_ARGS__)
@@ -39,7 +41,11 @@
 //
 
 static thread_local std::string g_lastErrorMessage;
-static const char* A2F_VERSION = "1.0.0";
+// 1.0.1: adds a2f_set_gpu_blendshape_solver and a2f_set_cuda_graphs (ondevice). 1.1.0 is taken by the server nb_tracks patch.
+static const char* A2F_VERSION = "1.0.1";
+
+// Solver choice for contexts created next (a2f_set_gpu_blendshape_solver). CPU by default.
+static std::atomic<bool> g_useGpuBlendshapeSolver{false};
 
 static void SetLastError(const std::string& msg) {
     g_lastErrorMessage = msg;
@@ -97,6 +103,9 @@ struct A2FContext {
     int deviceId = 0;
     std::size_t identityIndex = 0;
     bool useConstantNoise = true;
+    // Blendshape solve on the GPU (a2f_set_gpu_blendshape_solver). Results are copied back to deviceWeightsHost.
+    bool useGpuSolver = false;
+    std::vector<float> deviceWeightsHost;
 
     // Thread safety
     std::mutex mutex;
@@ -151,32 +160,16 @@ struct A2FSession {
 // SDK callback adapter
 //
 
-static void SdkHostResultsCallback(
-    void* userdata,
-    const nva2f::IBlendshapeExecutor::HostResults& results,
-    std::error_code errorCode
-) {
-    // userdata is now A2FContext*, not A2FSession*
-    auto* context = static_cast<A2FContext*>(userdata);
-    if (!context || !context->activeSession || !context->activeSession->callback) {
-        return;
-    }
-
+static void DeliverFrame(A2FContext* context, std::int64_t timeStampCurrentFrame, const float* srcData, std::size_t weightCount) {
     auto* session = context->activeSession;
-
-    if (errorCode) {
-        SetLastError(errorCode);
-        return;
-    }
 
     // Build frame structure
     A2FBlendshapeFrame frame;
-    frame.time_code = static_cast<double>(results.timeStampCurrentFrame) / 16000.0;
-    frame.weight_count = results.weights.Size();
+    frame.time_code = static_cast<double>(timeStampCurrentFrame) / 16000.0;
+    frame.weight_count = weightCount;
 
     // Copy weights to session buffer (so callback receives stable pointer)
     session->frameWeights.resize(frame.weight_count);
-    const float* srcData = results.weights.Data();
     std::copy(srcData, srcData + frame.weight_count, session->frameWeights.begin());
 
     // NaN/Inf safeguard: replace with 0.0 and log once
@@ -202,6 +195,45 @@ static void SdkHostResultsCallback(
 
     // Invoke user callback
     session->callback(session->userData, &frame);
+}
+
+static void SdkHostResultsCallback(
+    void* userdata,
+    const nva2f::IBlendshapeExecutor::HostResults& results,
+    std::error_code errorCode
+) {
+    // userdata is now A2FContext*, not A2FSession*
+    auto* context = static_cast<A2FContext*>(userdata);
+    if (!context || !context->activeSession || !context->activeSession->callback) {
+        return;
+    }
+    if (errorCode) {
+        SetLastError(errorCode);
+        return;
+    }
+    DeliverFrame(context, results.timeStampCurrentFrame, results.weights.Data(), results.weights.Size());
+}
+
+// GPU solver: the weights are on the device; copy them back on the results stream before handing them out.
+static bool SdkDeviceResultsCallback(void* userdata, const nva2f::IBlendshapeExecutor::DeviceResults& results) {
+    auto* context = static_cast<A2FContext*>(userdata);
+    if (!context || !context->activeSession || !context->activeSession->callback) {
+        return true;
+    }
+    const std::size_t count = results.weights.Size();
+    context->deviceWeightsHost.resize(count);
+    const auto copyErr = nva2x::CopyDeviceToHost(
+        nva2x::HostTensorFloatView{context->deviceWeightsHost.data(), count}, results.weights, results.cudaStream);
+    if (copyErr) {
+        SetLastError(copyErr);
+        return false;
+    }
+    if (cudaStreamSynchronize(results.cudaStream) != cudaSuccess) {
+        SetLastError("cudaStreamSynchronize failed after GPU blendshape solve");
+        return false;
+    }
+    DeliverFrame(context, results.timeStampCurrentFrame, context->deviceWeightsHost.data(), count);
+    return true;
 }
 
 
@@ -231,6 +263,7 @@ A2F_API A2FErrorCode a2f_context_create(
         ctx->deviceId = config->device_id;
         ctx->identityIndex = config->identity_index;
         ctx->useConstantNoise = (config->use_constant_noise != 0);
+        ctx->useGpuSolver = g_useGpuBlendshapeSolver.load();
 
         // Initialize CUDA
         auto err = nva2x::SetCudaDeviceIfNeeded(ctx->deviceId);
@@ -247,7 +280,7 @@ A2F_API A2FErrorCode a2f_context_create(
             1,  // nbTracks
             ctx->modelPath.c_str(),
             nva2f::IGeometryExecutor::ExecutionOption::SkinTongue,
-            false,  // useGpuSolver (use CPU for host results callback)
+            ctx->useGpuSolver,  // CPU by default (host results); GPU results come through SdkDeviceResultsCallback
             ctx->identityIndex,
             ctx->useConstantNoise,
             &rawModelInfoPtr,
@@ -307,7 +340,9 @@ A2F_API A2FErrorCode a2f_context_create(
         // This must be done BEFORE any Execute() calls, and cannot be changed afterwards
         {
             auto& executor = ctx->bundle->GetExecutor();
-            auto callbackErr = executor.SetResultsCallback(SdkHostResultsCallback, ctx.get());
+            auto callbackErr = ctx->useGpuSolver
+                ? executor.SetResultsCallback(SdkDeviceResultsCallback, ctx.get())
+                : executor.SetResultsCallback(SdkHostResultsCallback, ctx.get());
             if (callbackErr) {
                 SetLastError(callbackErr);
                 return A2F_ERROR_EXECUTION_FAILED;
@@ -1053,6 +1088,16 @@ A2F_API A2FErrorCode a2f_session_destroy(A2FSession* session) {
 
 A2F_API const char* a2f_get_last_error_message(void) {
     return g_lastErrorMessage.c_str();
+}
+
+A2F_API A2FErrorCode a2f_set_gpu_blendshape_solver(int enable) {
+    g_useGpuBlendshapeSolver.store(enable != 0);
+    return A2F_OK;
+}
+
+A2F_API A2FErrorCode a2f_set_cuda_graphs(int enable) {
+    nva2x::SetCudaGraphsEnabled(enable != 0);
+    return A2F_OK;
 }
 
 A2F_API const char* a2f_get_version(void) {

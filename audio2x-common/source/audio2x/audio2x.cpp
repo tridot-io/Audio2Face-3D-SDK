@@ -51,6 +51,14 @@ std::error_code nva2x::SetCudaDeviceIfNeeded(int device) {
   return internal::SetCudaDeviceIfNeeded(device);
 }
 
+void nva2x::SetCudaGraphsEnabled(bool enabled) {
+  internal::SetCudaGraphsEnabled(enabled);
+}
+
+bool nva2x::AreCudaGraphsEnabled() {
+  return internal::AreCudaGraphsEnabled();
+}
+
 
 // emotion_accumulator.h
 nva2x::IEmotionAccumulator* nva2x::CreateEmotionAccumulator(

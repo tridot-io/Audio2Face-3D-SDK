@@ -146,6 +146,28 @@ A2F_API A2FErrorCode a2f_context_create(
 );
 
 /**
+ * Choose where the blendshape (skin/tongue) solve runs for contexts created after this call.
+ * 0 (default): CPU, bounded least squares (the SDK sample behaviour).
+ * 1: GPU, ADMM approximation (SDK default iterations). About 35% less processing time per audio second and no
+ *    measurable extra GPU memory; the curves differ from the CPU solve (less upper-lip raise, more upper-lip roll).
+ * Existing contexts keep their solver. Added in wrapper 1.0.1 (ondevice branch); check the export, not the version.
+ *
+ * @param enable 1 for GPU, 0 for CPU
+ * @return A2F_OK
+ */
+A2F_API A2FErrorCode a2f_set_gpu_blendshape_solver(int enable);
+
+/**
+ * Record the A2E inference and the GPU blendshape solve once as CUDA graphs and replay them (process-wide).
+ * The output is identical; the A2F diffusion engine cannot be recorded and keeps running directly.
+ * 0 (default): off. Added in wrapper 1.0.1 (ondevice branch); check the export, not the version.
+ *
+ * @param enable 1 to turn CUDA graphs on, 0 to turn them off
+ * @return A2F_OK
+ */
+A2F_API A2FErrorCode a2f_set_cuda_graphs(int enable);
+
+/**
  * Destroy a context and release all resources.
  * All sessions must be destroyed before calling this.
  *

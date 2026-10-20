@@ -92,7 +92,10 @@ BlendshapeSolver::WorkingBuffer::WorkingBuffer(size_t numVertexPositions, size_t
 }
 
 BlendshapeSolver::BlendshapeSolver() : BlendshapeSolverBase() {
-  cudaEventCreateWithFlags(&preBlendshapeSolveCompleted, cudaEventDisableTiming);
+  // BlockingSync: the solver threads wait on this event with cudaEventSynchronize. Without it they spin at 100% CPU while
+  // the GPU geometry is computed (server 2026-10-20: 8 sessions 2.28 -> 1.09 cores, same latency and frames). Only the
+  // event flag changes the wait; cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) alone does not.
+  cudaEventCreateWithFlags(&preBlendshapeSolveCompleted, cudaEventDisableTiming | cudaEventBlockingSync);
 }
 
 BlendshapeSolver::~BlendshapeSolver() {

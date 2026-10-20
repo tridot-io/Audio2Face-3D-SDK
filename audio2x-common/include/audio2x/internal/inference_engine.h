@@ -23,6 +23,11 @@
 #include "audio2x/inference_engine.h"
 #include "audio2x/internal/integer_array.h"
 
+#include <cuda_runtime_api.h>
+
+#include <cstddef>
+#include <vector>
+
 #if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable : 4100 5204)
@@ -191,11 +196,33 @@ public:
   void Destroy() override;
   std::error_code Deallocate();
 
+  // Opt in to CUDA graph replay (see SetCudaGraphsEnabled). Kept across Init(). An engine with data-dependent shapes is
+  // never recorded even when allowed: its NonZero layer reads a device-to-host copy that a capture does not run, which
+  // crashed the game (2026-10-20, A2F diffusion engine built from the original ONNX). Init() looks for such layers.
+  void SetCudaGraphAllowed(bool allowed) { _cudaGraphAllowed = allowed; }
+  bool HasDataDependentShapes() const { return _hasDataDependentShapes; }
+
 private:
+  // CUDA graph replay of enqueueV3 (env A2X_CUDA_GRAPH=1). A graph is valid only for the tensor addresses and shapes it
+  // was captured with, so graphs are keyed by a signature of the current bindings (set in BindBuffers).
+  struct CudaGraphEntry {
+    std::size_t signature;
+    cudaGraphExec_t exec;
+  };
+  void TryCaptureCudaGraph(cudaStream_t cudaStream) const;
+  void ReleaseCudaGraphs();
+
   nvinfer1::IRuntime *_runtime;
   nvinfer1::ICudaEngine *_engine;
   nvinfer1::IExecutionContext *_context;
   bool _initialized;
+
+  mutable std::size_t _bindingSignature{0};
+  mutable std::vector<std::size_t> _seenSignatures;
+  mutable std::vector<CudaGraphEntry> _cudaGraphs;
+  mutable bool _cudaGraphDisabled{false};
+  bool _cudaGraphAllowed{false};
+  bool _hasDataDependentShapes{false};
 };
 
 } // namespace nva2x
